@@ -13,5 +13,9 @@ else
 fi
 
 # Add any compilation or linting commands after this line
+# Ensure the Zig server binary is up to date before running tests
+if command -v zig > /dev/null 2>&1; then
+  zig build >/dev/null
+fi
 
 $PYTHON_CMD -m test_runner.main "$@"

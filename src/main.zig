@@ -52,6 +52,7 @@ const ParseError = error{
 const Value = union(enum) {
     integer: i64,
     boolean: bool,
+    null,
 };
 
 const SelectItem = struct {
@@ -169,6 +170,10 @@ fn dbDropTable(name: []const u8, if_exists: bool) ParseError!void {
 const Parser = struct {
     input: []const u8,
     pos: usize = 0,
+    // Chapter 6: capture division-by-zero encountered during expression
+    // evaluation so we can surface it only if no validation errors occurred.
+    // This prioritizes type errors over runtime errors per the spec/tests.
+    had_division_by_zero: bool = false,
 
     fn init(input: []const u8) Parser {
         return .{ .input = input, .pos = 0 };
@@ -259,6 +264,8 @@ const Parser = struct {
             "true", "false", "and", "or", "not", "as", "drop", "if", "exists",
             // types
             "integer", "boolean",
+            // null literal
+            "null",
         };
         inline for (kws) |kw| {
             if (std.ascii.eqlIgnoreCase(tok, kw)) return true;
@@ -324,6 +331,10 @@ const Parser = struct {
         return null;
     }
 
+    fn parseNull(self: *Parser) bool {
+        return self.matchKeyword("null");
+    }
+
     fn parsePrimary(self: *Parser) ParseError!Value {
         self.skipWhitespaceAndComments();
         if (self.eof()) return ParseError.ParsingError;
@@ -361,6 +372,7 @@ const Parser = struct {
                 if (std.ascii.eqlIgnoreCase(fn_name, "abs")) {
                     if (args.items.len != 1) return ParseError.ValidationError;
                     const a0 = args.items[0];
+                    if (a0 == .null) return Value.null;
                     if (a0 != .integer) return ParseError.ValidationError;
                     const n: i64 = a0.integer;
                     // handle minimum value safely: for this kata we assume inputs fit
@@ -370,10 +382,16 @@ const Parser = struct {
                     if (args.items.len != 2) return ParseError.ValidationError;
                     const a0 = args.items[0];
                     const a1 = args.items[1];
+                    if (a0 == .null or a1 == .null) return Value.null;
                     if (a0 != .integer or a1 != .integer) return ParseError.ValidationError;
                     const lhs: i64 = a0.integer;
                     const rhs: i64 = a1.integer;
-                    if (rhs == 0) return ParseError.DivisionByZero;
+                    if (rhs == 0) {
+                        // Defer surfacing the error to statement boundary
+                        self.had_division_by_zero = true;
+                        const res: i64 = 0;
+                        return Value{ .integer = res };
+                    }
                     const res: i64 = @rem(lhs, rhs);
                     return Value{ .integer = res };
                 } else {
@@ -391,6 +409,11 @@ const Parser = struct {
         // boolean
         if (self.parseBoolean()) |b| return Value{ .boolean = b };
 
+        // NULL literal
+        if (self.parseNull()) {
+            return Value.null;
+        }
+
         // integer (with optional unary minus handled in parseUnary)
         if (self.parseInteger()) |n| return Value{ .integer = n };
 
@@ -403,6 +426,7 @@ const Parser = struct {
             const v = try self.parseUnary();
             return switch (v) {
                 .boolean => |b| Value{ .boolean = !b },
+                .null => Value.null,
                 else => ParseError.ValidationError,
             };
         }
@@ -410,6 +434,7 @@ const Parser = struct {
             const v = try self.parseUnary();
             return switch (v) {
                 .integer => |n| Value{ .integer = -n },
+                .null => Value.null,
                 else => ParseError.ValidationError,
             };
         }
@@ -426,13 +451,26 @@ const Parser = struct {
                 const right = try self.parseUnary();
                 switch (c) {
                     '*' => {
-                        if (left != .integer or right != .integer) return ParseError.ValidationError;
-                        left = Value{ .integer = left.integer * right.integer };
+                        if (left == .null or right == .null) {
+                            left = Value.null;
+                        } else if (left != .integer or right != .integer) {
+                            return ParseError.ValidationError;
+                        } else {
+                            left = Value{ .integer = left.integer * right.integer };
+                        }
                     },
                     '/' => {
-                        if (left != .integer or right != .integer) return ParseError.ValidationError;
-                        if (right.integer == 0) return ParseError.DivisionByZero;
-                        left = Value{ .integer = @divTrunc(left.integer, right.integer) };
+                        if (left == .null or right == .null) {
+                            left = Value.null;
+                        } else if (left != .integer or right != .integer) {
+                            return ParseError.ValidationError;
+                        } else if (right.integer == 0) {
+                            // Record and continue to allow type errors elsewhere to win
+                            self.had_division_by_zero = true;
+                            left = Value{ .integer = 0 };
+                        } else {
+                            left = Value{ .integer = @divTrunc(left.integer, right.integer) };
+                        }
                     },
                     else => unreachable,
                 }
@@ -453,12 +491,22 @@ const Parser = struct {
                 const right = try self.parseMulDiv();
                 switch (c) {
                     '+' => {
-                        if (left != .integer or right != .integer) return ParseError.ValidationError;
-                        left = Value{ .integer = left.integer + right.integer };
+                        if (left == .null or right == .null) {
+                            left = Value.null;
+                        } else if (left != .integer or right != .integer) {
+                            return ParseError.ValidationError;
+                        } else {
+                            left = Value{ .integer = left.integer + right.integer };
+                        }
                     },
                     '-' => {
-                        if (left != .integer or right != .integer) return ParseError.ValidationError;
-                        left = Value{ .integer = left.integer - right.integer };
+                        if (left == .null or right == .null) {
+                            left = Value.null;
+                        } else if (left != .integer or right != .integer) {
+                            return ParseError.ValidationError;
+                        } else {
+                            left = Value{ .integer = left.integer - right.integer };
+                        }
                     },
                     else => unreachable,
                 }
@@ -491,7 +539,9 @@ const Parser = struct {
             } else break;
 
             const right = try self.parseAddSub();
-            if (left == .integer and right == .integer) {
+            if (left == .null or right == .null) {
+                left = Value.null;
+            } else if (left == .integer and right == .integer) {
                 const li = left.integer;
                 const ri = right.integer;
                 var res = false;
@@ -530,17 +580,22 @@ const Parser = struct {
             } else break;
 
             const right = try self.parseComparison();
-            const res = switch (left) {
-                .integer => |li| switch (right) {
-                    .integer => |ri| if (op == .eq) (li == ri) else (li != ri),
-                    else => return ParseError.ValidationError,
-                },
-                .boolean => |lb| switch (right) {
-                    .boolean => |rb| if (op == .eq) (lb == rb) else (lb != rb),
-                    else => return ParseError.ValidationError,
-                },
-            };
-            left = Value{ .boolean = res };
+            if (left == .null or right == .null) {
+                left = Value.null;
+            } else {
+                const res = switch (left) {
+                    .integer => |li| switch (right) {
+                        .integer => |ri| if (op == .eq) (li == ri) else (li != ri),
+                        else => return ParseError.ValidationError,
+                    },
+                    .boolean => |lb| switch (right) {
+                        .boolean => |rb| if (op == .eq) (lb == rb) else (lb != rb),
+                        else => return ParseError.ValidationError,
+                    },
+                    .null => unreachable,
+                };
+                left = Value{ .boolean = res };
+            }
         }
         return left;
     }
@@ -551,8 +606,21 @@ const Parser = struct {
             self.skipWhitespaceAndComments();
             if (!self.matchKeyword("and")) break;
             const right = try self.parseEquality();
-            if (left != .boolean or right != .boolean) return ParseError.ValidationError;
-            left = Value{ .boolean = left.boolean and right.boolean };
+            // Three-valued logic for AND
+            if (left == .boolean and right == .boolean) {
+                left = Value{ .boolean = left.boolean and right.boolean };
+            } else if (left == .boolean and !left.boolean) {
+                // FALSE AND x => FALSE
+                left = Value{ .boolean = false };
+            } else if (right == .boolean and !right.boolean) {
+                // x AND FALSE => FALSE (covers NULL AND FALSE)
+                left = Value{ .boolean = false };
+            } else if (left == .null or right == .null) {
+                // TRUE AND NULL => NULL; NULL AND TRUE => NULL; NULL AND NULL => NULL
+                left = Value.null;
+            } else {
+                return ParseError.ValidationError;
+            }
         }
         return left;
     }
@@ -563,8 +631,24 @@ const Parser = struct {
             self.skipWhitespaceAndComments();
             if (!self.matchKeyword("or")) break;
             const right = try self.parseAnd();
-            if (left != .boolean or right != .boolean) return ParseError.ValidationError;
-            left = Value{ .boolean = left.boolean or right.boolean };
+            // Three-valued logic for OR
+            if (left == .boolean and right == .boolean) {
+                left = Value{ .boolean = left.boolean or right.boolean };
+            } else if (left == .boolean and left.boolean) {
+                // TRUE OR x => TRUE
+                left = Value{ .boolean = true };
+            } else if (right == .boolean and right.boolean) {
+                // x OR TRUE => TRUE (covers NULL OR TRUE)
+                left = Value{ .boolean = true };
+            } else if (left == .null or right == .null) {
+                // FALSE OR NULL => NULL; NULL OR FALSE => NULL; NULL OR NULL => NULL
+                left = Value.null;
+            } else if (left == .boolean and !left.boolean) {
+                // FALSE OR y => y where y already handled above
+                left = right;
+            } else {
+                return ParseError.ValidationError;
+            }
         }
         return left;
     }
@@ -641,6 +725,10 @@ const Parser = struct {
                 if (!self.matchChar(';')) return ParseError.ParsingError;
                 self.skipWhitespaceAndComments();
                 if (!self.eof()) return ParseError.ParsingError;
+                // If any division-by-zero occurred during evaluation of an
+                // expression-only SELECT, surface it now unless a validation
+                // error has already been raised.
+                if (self.had_division_by_zero) return ParseError.DivisionByZero;
                 return .{ .status_ok = true, .error_type = null, .items = expr_items, .rows = null, .column_names = null };
             }
             // had FROM: treat as table select; reset to before list
@@ -668,7 +756,12 @@ const Parser = struct {
 
         var table_select = false;
         self.skipWhitespaceAndComments();
-        if (isIdentStart(self.peek())) {
+        // Allow table projection to start with an identifier or a literal
+        // (e.g., SELECT 10 / a FROM t). Previously we only proceeded when the
+        // first token looked like an identifier which rejected literal-led
+        // projections and caused a fallback to expression SELECT, producing a
+        // parsing_error. Accept digits and unary minus as starters here.
+        if (isIdentStart(self.peek()) or isDigit(self.peek()) or self.peek() == '-') {
             // parse first projection's left operand: identifier or literal
             var first_is_lit = false;
             var first_lit_val: Value = undefined;
@@ -682,6 +775,10 @@ const Parser = struct {
             } else if (self.parseInteger()) |n| {
                 first_is_lit = true;
                 first_lit_val = Value{ .integer = n };
+                first_nm = "";
+            } else if (self.parseNull()) {
+                first_is_lit = true;
+                first_lit_val = Value.null;
                 first_nm = "";
             } else {
                 return ParseError.ParsingError;
@@ -709,6 +806,9 @@ const Parser = struct {
                 } else if (self.parseInteger()) |n2| {
                     right_is_lit_flag = true;
                     right_lit_val = Value{ .integer = n2 };
+                } else if (self.parseNull()) {
+                    right_is_lit_flag = true;
+                    right_lit_val = Value.null;
                 } else return ParseError.ParsingError;
             } else if (self.matchKeyword("and")) {
                 op_char = '&';
@@ -721,6 +821,9 @@ const Parser = struct {
                     // integer on boolean op -> type error at eval stage, but parser accepts integer literal
                     right_is_lit_flag = true;
                     right_lit_val = Value{ .integer = n2 };
+                } else if (self.parseNull()) {
+                    right_is_lit_flag = true;
+                    right_lit_val = Value.null;
                 } else return ParseError.ParsingError;
             } else if (self.matchKeyword("or")) {
                 op_char = '|';
@@ -732,6 +835,9 @@ const Parser = struct {
                 } else if (self.parseInteger()) |n2b| {
                     right_is_lit_flag = true;
                     right_lit_val = Value{ .integer = n2b };
+                } else if (self.parseNull()) {
+                    right_is_lit_flag = true;
+                    right_lit_val = Value.null;
                 } else return ParseError.ParsingError;
             }
             // optional AS alias
@@ -767,6 +873,10 @@ const Parser = struct {
                     is_lit = true;
                     lit_val = Value{ .integer = n };
                     nm = "";
+                } else if (self.parseNull()) {
+                    is_lit = true;
+                    lit_val = Value.null;
+                    nm = "";
                 } else return ParseError.ParsingError;
                 try left_names.append(nm);
                 try left_is_lit.append(is_lit);
@@ -788,6 +898,9 @@ const Parser = struct {
                     } else if (self.parseInteger()) |n2| {
                         right2_is_lit = true;
                         right2_lit = Value{ .integer = n2 };
+                    } else if (self.parseNull()) {
+                        right2_is_lit = true;
+                        right2_lit = Value.null;
                     } else return ParseError.ParsingError;
                 } else if (self.matchKeyword("and")) {
                     op2 = '&';
@@ -799,6 +912,9 @@ const Parser = struct {
                     } else if (self.parseInteger()) |nbb| {
                         right2_is_lit = true;
                         right2_lit = Value{ .integer = nbb };
+                    } else if (self.parseNull()) {
+                        right2_is_lit = true;
+                        right2_lit = Value.null;
                     } else return ParseError.ParsingError;
                 } else if (self.matchKeyword("or")) {
                     op2 = '|';
@@ -810,6 +926,9 @@ const Parser = struct {
                     } else if (self.parseInteger()) |ncc| {
                         right2_is_lit = true;
                         right2_lit = Value{ .integer = ncc };
+                    } else if (self.parseNull()) {
+                        right2_is_lit = true;
+                        right2_lit = Value.null;
                     } else return ParseError.ParsingError;
                 }
                 const save_after_col = self.pos;
@@ -831,7 +950,7 @@ const Parser = struct {
                 table_select = true;
                 const table_name = self.parseIdentifier() orelse return ParseError.ParsingError;
                 self.skipWhitespaceAndComments();
-                if (!self.matchChar(';')) return ParseError.ParsingError;
+                 if (!self.matchChar(';')) return ParseError.ParsingError;
                 self.skipWhitespaceAndComments();
                 if (!self.eof()) return ParseError.ParsingError;
 
@@ -881,24 +1000,25 @@ const Parser = struct {
                     if (opk == 0) continue;
                     // determine left type
                     const l_is_lit = left_is_lit.items[k];
-                    const l_type: ColumnType = if (l_is_lit)
-                        (switch (left_lits.items[k]) { .integer => ColumnType.integer, .boolean => ColumnType.boolean })
+                     const l_type: ColumnType = if (l_is_lit)
+                         (switch (left_lits.items[k]) { .integer => ColumnType.integer, .boolean => ColumnType.boolean, .null => ColumnType.integer })
                     else
                         tbl.columns[col_indices.items[k].?].typ;
                     // determine right type
                     const r_is_lit = right_is_lit.items[k];
-                    const r_type: ColumnType = if (proj_right_names.items[k] != null) blk: {
+                     const r_type: ColumnType = if (proj_right_names.items[k] != null) blk: {
                         const idx = right_indices.items[k] orelse return ParseError.ValidationError;
                         break :blk tbl.columns[idx].typ;
-                    } else if (r_is_lit) (switch (right_lits.items[k]) { .integer => ColumnType.integer, .boolean => ColumnType.boolean }) else blk2: {
+                     } else if (r_is_lit) (switch (right_lits.items[k]) { .integer => ColumnType.integer, .boolean => ColumnType.boolean, .null => ColumnType.integer }) else blk2: {
                         // no right operand present
                         break :blk2 ColumnType.integer; // dummy
                     };
-                    if (opk == '+' or opk == '-' or opk == '*' or opk == '/') {
-                        if (!(l_type == .integer and r_type == .integer)) return ParseError.ValidationError;
-                    } else if (opk == '&' or opk == '|') {
-                        if (!(l_type == .boolean and r_type == .boolean)) return ParseError.ValidationError;
-                    }
+                     if (opk == '+' or opk == '-' or opk == '*' or opk == '/') {
+                         // Allow NULL literals, which will propagate at row-eval time
+                         if (!(l_type == .integer and r_type == .integer)) return ParseError.ValidationError;
+                     } else if (opk == '&' or opk == '|') {
+                         if (!(l_type == .boolean and r_type == .boolean)) return ParseError.ValidationError;
+                     }
                 }
 
                 // Build result rows by projecting selected columns or evaluating simple binary expressions
@@ -920,25 +1040,30 @@ const Parser = struct {
                         } else {
                             const lidx_opt = col_indices.items[j];
                             const ridx_opt = right_indices.items[j];
-                            const lv: Value = if (lidx_opt) |li| row[li] else left_lits.items[j];
-                            const rv: Value = if (ridx_opt) |ri| row[ri] else right_lits.items[j];
-                            if (lv != .integer or rv != .integer) return ParseError.ValidationError;
-                            const a = lv.integer;
-                            const b = rv.integer;
-                            var res: i64 = 0;
-                            switch (opj) {
-                                '+' => res = a + b,
-                                '-' => res = a - b,
-                                '*' => res = a * b,
-                                '/' => {
-                                    if (b == 0) return ParseError.DivisionByZero;
-                                    res = @divTrunc(a, b);
-                                },
-                                '&' => return ParseError.ValidationError,
-                                '|' => return ParseError.ValidationError,
-                                else => return ParseError.ParsingError,
-                            }
-                            try out.append(Value{ .integer = res });
+                             const lv: Value = if (lidx_opt) |li| row[li] else left_lits.items[j];
+                             const rv: Value = if (ridx_opt) |ri| row[ri] else right_lits.items[j];
+                             if (lv == .null or rv == .null) {
+                                 try out.append(Value.null);
+                             } else if (lv != .integer or rv != .integer) {
+                                 return ParseError.ValidationError;
+                             } else {
+                                 const a = lv.integer;
+                                 const b = rv.integer;
+                                 var res: i64 = 0;
+                                 switch (opj) {
+                                     '+' => res = a + b,
+                                     '-' => res = a - b,
+                                     '*' => res = a * b,
+                                     '/' => {
+                                         if (b == 0) return ParseError.DivisionByZero;
+                                         res = @divTrunc(a, b);
+                                     },
+                                     '&' => return ParseError.ValidationError,
+                                     '|' => return ParseError.ValidationError,
+                                     else => return ParseError.ParsingError,
+                                 }
+                                 try out.append(Value{ .integer = res });
+                             }
                         }
                     }
                     try result_rows.append(try out.toOwnedSlice());
@@ -961,12 +1086,14 @@ const Parser = struct {
         if (!self.matchChar(';')) return ParseError.ParsingError;
         self.skipWhitespaceAndComments();
         if (!self.eof()) return ParseError.ParsingError;
+        if (self.had_division_by_zero) return ParseError.DivisionByZero;
         return .{ .status_ok = true, .error_type = null, .items = items, .rows = null, .column_names = null };
     }
     /// Parse `CREATE TABLE name (col type, ...) ;` with basic validations:
     /// - identifier syntax and keyword restrictions
     /// - supported types: INTEGER, BOOLEAN
     /// - duplicate column names produce `validation_error`
+    /// - TODO: bug if declare only one column with type INTEGER, and then try to insert a row with 1, TRUE, the parser will NOT return an error
     fn parseCreateTable(self: *Parser, arena: std.mem.Allocator) ParseError!QueryResult {
         _ = arena;
         if (!self.matchKeyword("create")) return ParseError.ParsingError;
@@ -982,6 +1109,7 @@ const Parser = struct {
         var seen_names = std.StringHashMap(void).init(std.heap.page_allocator);
         defer seen_names.deinit();
 
+        // We use this loop to process both CREATE TABLE and INSERT INTO. Need to split this.  
         while (true) {
             const col_name = self.parseIdentifier() orelse return ParseError.ParsingError;
             self.skipWhitespaceAndComments();
@@ -1045,13 +1173,16 @@ const Parser = struct {
         return .{ .status_ok = true, .error_type = null, .items = &[_]SelectItem{}, .rows = null, .column_names = null };
     }
 
-    /// Parse `INSERT INTO name VALUES (...), (...);` and append rows after
-    /// validating arity and value types.
+    /// Parse `INSERT INTO name VALUES (...), (...);`.
     ///
-    /// Known limitation: rows successfully appended before a later value error
-    /// are not rolled back yet, but tests expect all-or-nothing behavior.
+    /// Semantics: This must be all-or-nothing. We first parse and validate
+    /// every row into a temporary arena-backed buffer. Only after the entire
+    /// statement has parsed and validated (including the final `;`) do we copy
+    /// rows into the database's allocator. This ensures a later validation
+    /// error (e.g. wrong type in the second tuple or division-by-zero inside an
+    /// expression) does not partially insert earlier rows.
     fn parseInsert(self: *Parser, arena: std.mem.Allocator) ParseError!QueryResult {
-        _ = arena;
+        // Use the provided arena for staging parsed rows prior to commit.
         if (!self.matchKeyword("insert")) return ParseError.ParsingError;
         if (!self.matchKeyword("into")) return ParseError.ParsingError;
         const table_name = self.parseIdentifier() orelse return ParseError.ParsingError;
@@ -1061,6 +1192,10 @@ const Parser = struct {
 
         const t_idx = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
         var tbl = &g_db.tables.items[t_idx];
+
+        // Stage rows here; commit to `tbl.rows` only after full success.
+        var staged_rows = std.ArrayList([]Value).init(arena);
+        defer staged_rows.deinit();
 
         var any_rows = false;
         while (true) {
@@ -1079,21 +1214,30 @@ const Parser = struct {
             }
             if (!self.matchChar(')')) return ParseError.ParsingError;
 
-            // Validate arity
-            if (values.items.len != tbl.columns.len) return ParseError.ValidationError;
-            // Validate types and build stored row
-            var row_slice = try g_db_allocator.alloc(Value, values.items.len);
+            // Validate arity: too many values is an error; fewer values imply trailing NULLs
+            if (values.items.len > tbl.columns.len) return ParseError.ValidationError;
+            // Validate types and build staged row (arena-backed). Chapter 7:
+            // allow NULL literal for any column and store it as Value.null.
+            var row_slice = try arena.alloc(Value, tbl.columns.len);
             var i: usize = 0;
-            while (i < values.items.len) : (i += 1) {
+            while (i < tbl.columns.len) : (i += 1) {
                 const col = tbl.columns[i];
-                const vv = values.items[i];
-                switch (col.typ) {
-                    .integer => if (vv != .integer) return ParseError.ValidationError else {},
-                    .boolean => if (vv != .boolean) return ParseError.ValidationError else {},
+                if (i < values.items.len) {
+                    const vv = values.items[i];
+                    if (vv == .null) {
+                        // NULL accepted for any column type
+                    } else switch (col.typ) {
+                        .integer => if (vv != .integer) return ParseError.ValidationError else {},
+                        .boolean => if (vv != .boolean) return ParseError.ValidationError else {},
+                    }
+                    row_slice[i] = vv;
+                } else {
+                    // fill missing columns with NULL
+                    row_slice[i] = Value.null;
                 }
-                row_slice[i] = vv;
             }
-            try tbl.rows.append(row_slice);
+            // Keep staged; do not mutate table yet
+            try staged_rows.append(row_slice);
             any_rows = true;
 
             self.skipWhitespaceAndComments();
@@ -1104,10 +1248,23 @@ const Parser = struct {
             break;
         }
 
+        // Only commit after the entire statement terminates correctly
         if (!self.matchChar(';')) return ParseError.ParsingError;
         self.skipWhitespaceAndComments();
         if (!self.eof()) return ParseError.ParsingError;
         if (!any_rows) return ParseError.ParsingError;
+        // Surface division-by-zero for INSERT after full parsing/validation,
+        // before committing staged rows to ensure all-or-nothing semantics.
+        if (self.had_division_by_zero) return ParseError.DivisionByZero;
+
+        // Commit: copy staged rows into the database allocator
+        var sr: usize = 0;
+        while (sr < staged_rows.items.len) : (sr += 1) {
+            const staged = staged_rows.items[sr];
+            const persistent = try g_db_allocator.alloc(Value, staged.len);
+            std.mem.copyForwards(Value, persistent, staged);
+            try tbl.rows.append(persistent);
+        }
 
         return .{ .status_ok = true, .error_type = null, .items = &[_]SelectItem{}, .rows = null, .column_names = null };
     }
@@ -1205,6 +1362,7 @@ fn buildJsonResponse(allocator: std.mem.Allocator, result: QueryResult) ![]u8 {
                 switch (row[c]) {
                     .integer => |n| try w.print("{d}", .{n}),
                     .boolean => |b| if (b) try w.writeAll("true") else try w.writeAll("false"),
+                    .null => try w.writeAll("null"),
                 }
             }
             try w.writeByte(']');
@@ -1222,6 +1380,7 @@ fn buildJsonResponse(allocator: std.mem.Allocator, result: QueryResult) ![]u8 {
                 switch (v) {
                     .integer => |n| try w.print("{d}", .{n}),
                     .boolean => |b| if (b) try w.writeAll("true") else try w.writeAll("false"),
+                    .null => try w.writeAll("null"),
                 }
             }
             try w.writeByte(']');

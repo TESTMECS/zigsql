@@ -606,20 +606,22 @@ const Parser = struct {
             self.skipWhitespaceAndComments();
             if (!self.matchKeyword("and")) break;
             const right = try self.parseEquality();
+            // Enforce operand types: only boolean or NULL are allowed
+            if (!((left == .boolean) or (left == .null)) or !((right == .boolean) or (right == .null)))
+                return ParseError.ValidationError;
             // Three-valued logic for AND
-            if (left == .boolean and right == .boolean) {
-                left = Value{ .boolean = left.boolean and right.boolean };
-            } else if (left == .boolean and !left.boolean) {
+            if (left == .boolean and !left.boolean) {
                 // FALSE AND x => FALSE
                 left = Value{ .boolean = false };
             } else if (right == .boolean and !right.boolean) {
-                // x AND FALSE => FALSE (covers NULL AND FALSE)
+                // x AND FALSE => FALSE
                 left = Value{ .boolean = false };
             } else if (left == .null or right == .null) {
                 // TRUE AND NULL => NULL; NULL AND TRUE => NULL; NULL AND NULL => NULL
                 left = Value.null;
             } else {
-                return ParseError.ValidationError;
+                // both booleans and neither is FALSE
+                left = Value{ .boolean = left.boolean and right.boolean };
             }
         }
         return left;
@@ -631,23 +633,22 @@ const Parser = struct {
             self.skipWhitespaceAndComments();
             if (!self.matchKeyword("or")) break;
             const right = try self.parseAnd();
+            // Enforce operand types: only boolean or NULL are allowed
+            if (!((left == .boolean) or (left == .null)) or !((right == .boolean) or (right == .null)))
+                return ParseError.ValidationError;
             // Three-valued logic for OR
-            if (left == .boolean and right == .boolean) {
-                left = Value{ .boolean = left.boolean or right.boolean };
-            } else if (left == .boolean and left.boolean) {
+            if (left == .boolean and left.boolean) {
                 // TRUE OR x => TRUE
                 left = Value{ .boolean = true };
             } else if (right == .boolean and right.boolean) {
-                // x OR TRUE => TRUE (covers NULL OR TRUE)
+                // x OR TRUE => TRUE
                 left = Value{ .boolean = true };
             } else if (left == .null or right == .null) {
                 // FALSE OR NULL => NULL; NULL OR FALSE => NULL; NULL OR NULL => NULL
                 left = Value.null;
-            } else if (left == .boolean and !left.boolean) {
-                // FALSE OR y => y where y already handled above
-                left = right;
             } else {
-                return ParseError.ValidationError;
+                // both booleans and neither is TRUE
+                left = Value{ .boolean = left.boolean or right.boolean };
             }
         }
         return left;

@@ -175,6 +175,13 @@ const Parser = struct {
     // This prioritizes type errors over runtime errors per the spec/tests.
     had_division_by_zero: bool = false,
 
+    // When evaluating expressions in table context (WHERE/ORDER BY), resolve
+    // bare identifiers as column references using the current row. When null,
+    // identifiers are not allowed and cause a validation/parsing error as per
+    // clause-specific rules.
+    eval_columns: ?[]const ColumnDef = null,
+    eval_row: ?[]const Value = null,
+
     fn init(input: []const u8) Parser {
         return .{ .input = input, .pos = 0 };
     }
@@ -404,6 +411,24 @@ const Parser = struct {
             }
         } else {
             self.pos = save_fn;
+        }
+
+        // Column reference in table context
+        if (self.eval_columns) |cols| {
+            const save_ident = self.pos;
+            if (self.parseIdentifier()) |col_name| {
+                // resolve column index
+                var idx: ?usize = null;
+                var i: usize = 0;
+                while (i < cols.len) : (i += 1) {
+                    if (std.mem.eql(u8, cols[i].name, col_name)) { idx = i; break; }
+                }
+                if (idx == null) return ParseError.ValidationError;
+                const row_vals = self.eval_row orelse return ParseError.ValidationError;
+                return row_vals[idx.?];
+            } else {
+                self.pos = save_ident;
+            }
         }
 
         // boolean
@@ -787,7 +812,8 @@ const Parser = struct {
 
             try left_names.append(first_nm);
             try left_is_lit.append(first_is_lit);
-            if (first_is_lit) try left_lits.append(first_lit_val);
+            // Maintain left_lits length equal to projection count
+            try left_lits.append(if (first_is_lit) first_lit_val else Value.null);
 
             // optional binary op with another operand (identifier or literal)
             self.skipWhitespaceAndComments();
@@ -855,7 +881,8 @@ const Parser = struct {
             try proj_ops.append(op_char);
             try proj_right_names.append(right_nm);
             try right_is_lit.append(right_is_lit_flag);
-            if (right_is_lit_flag) try right_lits.append(right_lit_val);
+            // Maintain right_lits length equal to projection count
+            try right_lits.append(if (right_is_lit_flag) right_lit_val else Value.null);
 
             while (true) {
                 self.skipWhitespaceAndComments();
@@ -881,7 +908,7 @@ const Parser = struct {
                 } else return ParseError.ParsingError;
                 try left_names.append(nm);
                 try left_is_lit.append(is_lit);
-                if (is_lit) try left_lits.append(lit_val);
+                try left_lits.append(if (is_lit) lit_val else Value.null);
                 self.skipWhitespaceAndComments();
                 var op2: u8 = 0;
                 var right2: ?[]const u8 = null;
@@ -944,14 +971,229 @@ const Parser = struct {
                 try proj_ops.append(op2);
                 try proj_right_names.append(right2);
                 try right_is_lit.append(right2_is_lit);
-                if (right2_is_lit) try right_lits.append(right2_lit);
+                try right_lits.append(if (right2_is_lit) right2_lit else Value.null);
             }
             self.skipWhitespaceAndComments();
             if (self.matchKeyword("from")) {
                 table_select = true;
                 const table_name = self.parseIdentifier() orelse return ParseError.ParsingError;
                 self.skipWhitespaceAndComments();
-                 if (!self.matchChar(';')) return ParseError.ParsingError;
+                // Optional clauses: WHERE, ORDER BY, LIMIT/OFFSET, then ';'
+                var where_slice: ?[]const u8 = null;
+                var order_by_alias: ?[]const u8 = null;
+                var order_by_expr_slice: ?[]const u8 = null;
+                var order_desc = false;
+                var limit_slice: ?[]const u8 = null;
+                var offset_slice: ?[]const u8 = null;
+
+                // WHERE
+                const after_from_pos = self.pos;
+                if (self.matchKeyword("where")) {
+                    const where_start = self.pos;
+                    // For initial parse, allow resolving identifiers as columns using dummy row
+                    // to locate end of expression and catch obvious type errors early.
+                    const t_idx_preview = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                    const tbl_preview = g_db.tables.items[t_idx_preview];
+                    var dummy_row = try arena.alloc(Value, tbl_preview.columns.len);
+                    defer arena.free(dummy_row);
+                    var di: usize = 0;
+                    while (di < tbl_preview.columns.len) : (di += 1) {
+                        dummy_row[di] = switch (tbl_preview.columns[di].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                    }
+                    var sub = Parser.init(self.input[where_start..]);
+                    sub.eval_columns = tbl_preview.columns;
+                    sub.eval_row = dummy_row;
+                    const where_preview_val = sub.parseExpression() catch |err| return err;
+                    sub.skipWhitespaceAndComments();
+                    // Type check WHERE: must evaluate to boolean or null
+                    switch (where_preview_val) {
+                        .boolean => {},
+                        .null => {},
+                        else => return ParseError.ValidationError,
+                    }
+                    // capture slice consumed by sub
+                    const where_len = sub.pos;
+                    where_slice = self.input[where_start .. where_start + where_len];
+                    self.pos = where_start + where_len;
+                    self.skipWhitespaceAndComments();
+                } else {
+                    self.pos = after_from_pos;
+                }
+
+                // ORDER BY
+                const after_where_pos = self.pos;
+                if (self.matchKeyword("order")) {
+                    if (!self.matchKeyword("by")) return ParseError.ParsingError;
+                    self.skipWhitespaceAndComments();
+                    // Try bare identifier (could be alias or column). If found, treat as minimal expression slice
+                    const expr_start = self.pos;
+                    // If the next token is ASC/DESC directly, treat as missing expression
+                    const save_after_by = self.pos;
+                    if (self.matchKeyword("asc") or self.matchKeyword("desc")) {
+                        return ParseError.ParsingError;
+                    }
+                    self.pos = save_after_by;
+                    const save_ob = self.pos;
+                    if (self.parseIdentifier()) |maybe_ident| {
+                        // After an identifier, decide if this is a simple identifier ORDER BY
+                        // or the start of a larger expression (e.g., ident + 2).
+                        const ident_end = self.pos;
+                        const save_ws = self.pos;
+                        self.skipWhitespaceAndComments();
+                        const order_clause_ends_here = blk: {
+                            const save_kw = self.pos;
+                            var ends = false;
+                            if (self.matchKeyword("asc") or self.matchKeyword("desc") or self.matchKeyword("limit") or self.matchKeyword("offset")) {
+                                ends = true;
+                            } else if (self.peek() == ';') {
+                                ends = true;
+                            }
+                            self.pos = save_kw;
+                            break :blk ends;
+                        };
+                        const cnext = self.peek();
+                        // If the next token starts an identifier that is not an allowed keyword and
+                        // we're still inside the ORDER BY expression (no ASC/DESC/LIMIT/OFFSET yet),
+                        // then it's a parsing error (e.g., CLOCKWISE).
+                        if (!order_clause_ends_here and isIdentStart(cnext)) return ParseError.ParsingError;
+                        const looks_like_expr = (cnext == '+' or cnext == '-' or cnext == '*' or cnext == '/' or cnext == '(' or cnext == '<' or cnext == '>' or cnext == '=' or isDigit(cnext));
+                        self.pos = save_ws;
+                        if (!order_clause_ends_here and looks_like_expr) {
+                            // Rewind and parse full expression instead
+                            self.pos = expr_start;
+                            var sub2 = Parser.init(self.input[expr_start..]);
+                            const t_idx_preview2 = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                            const tbl_preview2 = g_db.tables.items[t_idx_preview2];
+                            var dummy_row2 = try arena.alloc(Value, tbl_preview2.columns.len);
+                            defer arena.free(dummy_row2);
+                            var dj2: usize = 0;
+                            while (dj2 < tbl_preview2.columns.len) : (dj2 += 1) {
+                                dummy_row2[dj2] = switch (tbl_preview2.columns[dj2].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                            }
+                            sub2.eval_columns = tbl_preview2.columns;
+                            sub2.eval_row = dummy_row2;
+                            _ = sub2.parseExpression() catch |err| return err;
+                            sub2.skipWhitespaceAndComments();
+                            const order_expr_len2 = sub2.pos;
+                            if (order_expr_len2 == 0) return ParseError.ParsingError;
+                            order_by_expr_slice = self.input[expr_start .. expr_start + order_expr_len2];
+                            self.pos = expr_start + order_expr_len2;
+                        } else {
+                            order_by_alias = maybe_ident; // may resolve later; harmless if not found
+                            // expression slice covers just the identifier; direction handling follows
+                            const ident_len = ident_end - expr_start;
+                            order_by_expr_slice = self.input[expr_start .. expr_start + ident_len];
+                            // Validate identifier now if it's not a select-list alias: it must be a table column
+                            var is_sel_alias = false;
+                            var oi_chk: usize = 0;
+                            while (oi_chk < out_names.items.len) : (oi_chk += 1) {
+                                if (std.mem.eql(u8, out_names.items[oi_chk], maybe_ident)) { is_sel_alias = true; break; }
+                            }
+                            if (!is_sel_alias) {
+                                const t_idx_preview2 = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                                const tbl_preview2 = g_db.tables.items[t_idx_preview2];
+                                var found_col = false;
+                                var ci_chk: usize = 0;
+                                while (ci_chk < tbl_preview2.columns.len) : (ci_chk += 1) {
+                                    if (std.mem.eql(u8, tbl_preview2.columns[ci_chk].name, maybe_ident)) { found_col = true; break; }
+                                }
+                                if (!found_col) return ParseError.ValidationError;
+                            }
+                        }
+                    } else {
+                        // Parse full expression (like -a)
+                        self.pos = save_ob;
+                        var sub2 = Parser.init(self.input[expr_start..]);
+                        // For expressions, allow column resolution
+                        const t_idx_preview2 = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                        const tbl_preview2 = g_db.tables.items[t_idx_preview2];
+                        // Use same dummy row as above technique
+                        var dummy_row2 = try arena.alloc(Value, tbl_preview2.columns.len);
+                        defer arena.free(dummy_row2);
+                        var dj: usize = 0;
+                        while (dj < tbl_preview2.columns.len) : (dj += 1) {
+                            dummy_row2[dj] = switch (tbl_preview2.columns[dj].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                        }
+                        sub2.eval_columns = tbl_preview2.columns;
+                        sub2.eval_row = dummy_row2;
+                        _ = sub2.parseExpression() catch |err| return err;
+                        sub2.skipWhitespaceAndComments();
+                        const order_expr_len = sub2.pos;
+                        if (order_expr_len == 0) return ParseError.ParsingError;
+                        order_by_expr_slice = self.input[expr_start .. expr_start + order_expr_len];
+                        self.pos = expr_start + order_expr_len;
+                    }
+                    self.skipWhitespaceAndComments();
+                    // direction
+                    const save_dir = self.pos;
+                    if (order_by_expr_slice == null) {
+                        return ParseError.ParsingError;
+                    } else if (self.matchKeyword("asc")) {
+                        order_desc = false;
+                    } else if (self.matchKeyword("desc")) {
+                        order_desc = true;
+                    } else {
+                        self.pos = save_dir;
+                        order_desc = false; // default ASC
+                    }
+                    self.skipWhitespaceAndComments();
+                    // After ORDER BY expression and optional direction, only LIMIT/OFFSET or ';' may follow
+                    const save_extra = self.pos;
+                    if (!(self.matchKeyword("limit") or self.matchKeyword("offset") or self.peek() == ';')) {
+                        return ParseError.ParsingError;
+                    }
+                    // rewind so LIMIT/OFFSET loop can handle it
+                    self.pos = save_extra;
+                    self.skipWhitespaceAndComments();
+                } else {
+                    self.pos = after_where_pos;
+                }
+
+                // LIMIT/OFFSET (either order)
+                var seen_limit = false;
+                var seen_offset = false;
+                while (true) {
+                    const save_clause = self.pos;
+                    if (!seen_limit and self.matchKeyword("limit")) {
+                        self.skipWhitespaceAndComments();
+                        // Reject identifiers explicitly for LIMIT
+                        const save_l = self.pos;
+                        if (self.parseIdentifier()) |_| return ParseError.ValidationError else self.pos = save_l;
+                        const start_l = self.pos;
+                        var subl = Parser.init(self.input[start_l..]);
+                        // Do not allow column resolution in LIMIT
+                        _ = subl.parseExpression() catch |err| return err;
+                        subl.skipWhitespaceAndComments();
+                        const elen = subl.pos;
+                        if (elen == 0) return ParseError.ParsingError;
+                        limit_slice = self.input[start_l .. start_l + elen];
+                        self.pos = start_l + elen;
+                        self.skipWhitespaceAndComments();
+                        seen_limit = true;
+                        continue;
+                    }
+                    if (!seen_offset and self.matchKeyword("offset")) {
+                        self.skipWhitespaceAndComments();
+                        // Reject identifiers explicitly for OFFSET
+                        const save_o = self.pos;
+                        if (self.parseIdentifier()) |_| return ParseError.ValidationError else self.pos = save_o;
+                        const start_o = self.pos;
+                        var subo = Parser.init(self.input[start_o..]);
+                        _ = subo.parseExpression() catch |err| return err;
+                        subo.skipWhitespaceAndComments();
+                        const olen = subo.pos;
+                        if (olen == 0) return ParseError.ParsingError;
+                        offset_slice = self.input[start_o .. start_o + olen];
+                        self.pos = start_o + olen;
+                        self.skipWhitespaceAndComments();
+                        seen_offset = true;
+                        continue;
+                    }
+                    self.pos = save_clause;
+                    break;
+                }
+
+                if (!self.matchChar(';')) return ParseError.ParsingError;
                 self.skipWhitespaceAndComments();
                 if (!self.eof()) return ParseError.ParsingError;
 
@@ -1024,8 +1266,27 @@ const Parser = struct {
 
                 // Build result rows by projecting selected columns or evaluating simple binary expressions
                 var result_rows = std.ArrayList([]Value).init(arena);
+                var source_row_indices = std.ArrayList(usize).init(arena);
+                errdefer source_row_indices.deinit();
                 errdefer result_rows.deinit();
-                for (tbl.rows.items) |row| {
+                var row_index: usize = 0;
+                while (row_index < tbl.rows.items.len) : (row_index += 1) {
+                    const row = tbl.rows.items[row_index];
+                    // WHERE filtering
+                    if (where_slice) |ws| {
+                        var p = Parser.init(ws);
+                        p.eval_columns = tbl.columns;
+                        p.eval_row = row;
+                        const cond = p.parseExpression() catch |err| return err;
+                        p.skipWhitespaceAndComments();
+                        if (!p.eof()) return ParseError.ParsingError;
+                        if (p.had_division_by_zero) return ParseError.DivisionByZero;
+                        switch (cond) {
+                            .boolean => |b| if (!b) continue,
+                            .null => continue,
+                            else => return ParseError.ValidationError,
+                        }
+                    }
                     var out = std.ArrayList(Value).init(arena);
                     errdefer out.deinit();
                     var j: usize = 0;
@@ -1067,14 +1328,137 @@ const Parser = struct {
                              }
                         }
                     }
+                    try source_row_indices.append(row_index);
                     try result_rows.append(try out.toOwnedSlice());
+                }
+
+                // ORDER BY
+                if (order_by_alias != null or order_by_expr_slice != null) {
+                    // Build keys for sorting
+                    var keys = std.ArrayList(Value).init(arena);
+                    errdefer keys.deinit();
+                    var alias_idx: ?usize = null;
+                    if (order_by_alias) |alias_name| {
+                        // resolve against out_names
+                        var oi: usize = 0;
+                        while (oi < out_names.items.len) : (oi += 1) {
+                            if (std.mem.eql(u8, out_names.items[oi], alias_name)) { alias_idx = oi; break; }
+                        }
+                    }
+                    var rix: usize = 0;
+                    while (rix < result_rows.items.len) : (rix += 1) {
+                        const base_row = tbl.rows.items[source_row_indices.items[rix]];
+                        var key: Value = Value.null;
+                        if (alias_idx) |ai| {
+                            key = result_rows.items[rix][ai];
+                        } else if (order_by_expr_slice) |obs| {
+                            var p3 = Parser.init(obs);
+                            p3.eval_columns = tbl.columns;
+                            p3.eval_row = base_row;
+                            const kv = p3.parseExpression() catch |err| return err;
+                            p3.skipWhitespaceAndComments();
+                            if (!p3.eof()) return ParseError.ParsingError;
+                            if (kv != .integer and kv != .boolean and kv != .null) return ParseError.ValidationError;
+                            key = kv;
+                        } else {
+                            // Alias requested but not found -> validation error
+                            return ParseError.ValidationError;
+                        }
+                        try keys.append(key);
+                    }
+
+                    // Comparator
+                    const asc = !order_desc;
+                    // Implement a sort on indices to avoid moving large rows
+                    var order_indices = try arena.alloc(usize, result_rows.items.len);
+                    var oi2: usize = 0;
+                    while (oi2 < order_indices.len) : (oi2 += 1) order_indices[oi2] = oi2;
+                    const Cmp = struct {
+                        keys: []const Value,
+                        asc: bool,
+                        pub fn lt(ctx: @This(), idx_i: usize, idx_j: usize) bool {
+                            const ki = ctx.keys[idx_i];
+                            const kj = ctx.keys[idx_j];
+                            if (ki == .null and kj != .null) return !ctx.asc; // nulls last in asc
+                            if (ki != .null and kj == .null) return ctx.asc;
+                            if (ki == .null and kj == .null) return false;
+                            switch (ki) {
+                                .integer => |ivi| switch (kj) {
+                                    .integer => |jvi| return if (ctx.asc) ivi < jvi else ivi > jvi,
+                                    .boolean => |_| return if (ctx.asc) true else false, // integers < booleans arbitrarily; not tested
+                                    .null => unreachable,
+                                },
+                                .boolean => |ib| switch (kj) {
+                                    .boolean => |jb| return if (ctx.asc) ((!ib and jb) or (ib == jb and false)) else ((ib and !jb) or (ib == jb and false)),
+                                    .integer => |_| return if (ctx.asc) false else true,
+                                    .null => unreachable,
+                                },
+                                .null => unreachable,
+                            }
+                        }
+                    };
+                    const cmp_info = Cmp{ .keys = keys.items, .asc = asc };
+                    std.sort.heap(usize, order_indices, cmp_info, struct {
+                        pub fn lessThan(info: Cmp, ai: usize, bi: usize) bool { return info.lt(ai, bi); }
+                    }.lessThan);
+                    // reorder result_rows according to order_indices
+                    var sorted_rows = std.ArrayList([]Value).init(arena);
+                    errdefer sorted_rows.deinit();
+                    var si: usize = 0;
+                    while (si < order_indices.len) : (si += 1) {
+                        try sorted_rows.append(result_rows.items[order_indices[si]]);
+                    }
+                    result_rows.deinit();
+                    result_rows = sorted_rows;
+                }
+
+                // LIMIT/OFFSET application
+                var start_idx: usize = 0;
+                var max_rows: ?usize = null;
+                if (offset_slice) |os| {
+                    var pofs = Parser.init(os);
+                    const v = pofs.parseExpression() catch |err| return err;
+                    pofs.skipWhitespaceAndComments();
+                    if (!pofs.eof()) return ParseError.ParsingError;
+                    switch (v) {
+                        .integer => |n| start_idx = if (n < 0) 0 else @intCast(n),
+                        .null => start_idx = 0,
+                        else => return ParseError.ValidationError,
+                    }
+                }
+                if (limit_slice) |ls| {
+                    var plim = Parser.init(ls);
+                    const v = plim.parseExpression() catch |err| return err;
+                    plim.skipWhitespaceAndComments();
+                    if (!plim.eof()) return ParseError.ParsingError;
+                    switch (v) {
+                        .integer => |n| max_rows = if (n < 0) 0 else @intCast(n),
+                        .null => max_rows = null,
+                        else => return ParseError.ValidationError,
+                    }
+                }
+
+                // Slice rows according to offset/limit
+                const total = result_rows.items.len;
+                if (start_idx > total) start_idx = total;
+                var end_idx = total;
+                if (max_rows) |lim| {
+                    const lim_end = start_idx + lim;
+                    end_idx = if (lim_end < total) lim_end else total;
+                }
+                // Build final slice
+                var final_rows = std.ArrayList([]Value).init(arena);
+                errdefer final_rows.deinit();
+                var ri: usize = start_idx;
+                while (ri < end_idx) : (ri += 1) {
+                    try final_rows.append(result_rows.items[ri]);
                 }
 
                 return .{
                     .status_ok = true,
                     .error_type = null,
                     .items = &[_]SelectItem{},
-                    .rows = try result_rows.toOwnedSlice(),
+                    .rows = try final_rows.toOwnedSlice(),
                     .column_names = try out_names.toOwnedSlice(),
                 };
             }

@@ -181,6 +181,7 @@ const Parser = struct {
     // clause-specific rules.
     eval_columns: ?[]const ColumnDef = null,
     eval_row: ?[]const Value = null,
+    eval_table_name: ?[]const u8 = null,
 
     fn init(input: []const u8) Parser {
         return .{ .input = input, .pos = 0 };
@@ -406,22 +407,44 @@ const Parser = struct {
                     return ParseError.ValidationError;
                 }
             } else {
-                // not a function call; rollback
+                // not a function call; if IDENT matches a known function name,
+                // this is a missing opening bracket -> parsing_error
+                if (std.ascii.eqlIgnoreCase(fn_name, "abs") or std.ascii.eqlIgnoreCase(fn_name, "mod")) {
+                    return ParseError.ParsingError;
+                }
+                // Otherwise rollback to let other primary forms try
                 self.pos = save_fn;
             }
         } else {
             self.pos = save_fn;
         }
 
-        // Column reference in table context
+        // Column reference in table context (supports qualified t.a and bare a)
         if (self.eval_columns) |cols| {
             const save_ident = self.pos;
-            if (self.parseIdentifier()) |col_name| {
-                // resolve column index
+            if (self.parseIdentifier()) |first_ident| {
+                var use_col_name: []const u8 = first_ident;
+                // Optional qualified form: table.column
+                const save_after_first = self.pos;
+                self.skipWhitespaceAndComments();
+                if (self.matchChar('.')) {
+                    // must have table name match
+                    const tname = self.eval_table_name orelse return ParseError.ValidationError;
+                    if (!std.ascii.eqlIgnoreCase(first_ident, tname)) return ParseError.ValidationError;
+                    const col_ident = self.parseIdentifier() orelse return ParseError.ValidationError;
+                    // ensure no further dots
+                    self.skipWhitespaceAndComments();
+                    if (self.matchChar('.')) return ParseError.ValidationError;
+                    use_col_name = col_ident;
+                } else {
+                    // rollback whitespace movement if not qualified
+                    self.pos = save_after_first;
+                }
+                // resolve column index case-insensitively
                 var idx: ?usize = null;
                 var i: usize = 0;
                 while (i < cols.len) : (i += 1) {
-                    if (std.mem.eql(u8, cols[i].name, col_name)) { idx = i; break; }
+                    if (std.ascii.eqlIgnoreCase(cols[i].name, use_col_name)) { idx = i; break; }
                 }
                 if (idx == null) return ParseError.ValidationError;
                 const row_vals = self.eval_row orelse return ParseError.ValidationError;
@@ -442,6 +465,12 @@ const Parser = struct {
         // integer (with optional unary minus handled in parseUnary)
         if (self.parseInteger()) |n| return Value{ .integer = n };
 
+        // If we saw an identifier but had no table context, treat as a validation error
+        const save_unknown = self.pos;
+        if (self.parseIdentifier()) |_| {
+            self.pos = save_unknown;
+            return ParseError.ValidationError;
+        }
         return ParseError.ParsingError;
     }
 
@@ -743,6 +772,30 @@ const Parser = struct {
                 self.pos = save_items;
                 expr_parse_ok = false;
             },
+            error.ValidationError => {
+                // Heuristic: if a FROM appears later, this is likely a table SELECT
+                // where identifiers in the select list will be resolved against the table.
+                var i_scan: usize = save_items;
+                var found_from = false;
+                while (i_scan + 4 <= self.input.len) : (i_scan += 1) {
+                    const c = std.ascii.toLower(self.input[i_scan]);
+                    if (c == 'f' and i_scan + 4 <= self.input.len) {
+                        const kw = self.input[i_scan .. i_scan + 4];
+                        if (std.ascii.eqlIgnoreCase(kw, "from")) {
+                            // word boundary after 'from'
+                            const after = i_scan + 4;
+                            const boundary = after >= self.input.len or !isIdentChar(self.input[after]);
+                            if (boundary) { found_from = true; break; }
+                        }
+                    }
+                }
+                if (found_from) {
+                    self.pos = save_items;
+                    expr_parse_ok = false;
+                } else {
+                    return err;
+                }
+            },
             else => return err,
         }
         if (expr_parse_ok) {
@@ -779,6 +832,11 @@ const Parser = struct {
         errdefer right_is_lit.deinit();
         var right_lits = std.ArrayList(Value).init(arena);
         errdefer right_lits.deinit();
+        // Optional table qualifiers for identifiers (e.g., t1.a)
+        var left_qualifiers = std.ArrayList(?[]const u8).init(arena);
+        errdefer left_qualifiers.deinit();
+        var right_qualifiers = std.ArrayList(?[]const u8).init(arena);
+        errdefer right_qualifiers.deinit();
 
         var table_select = false;
         self.skipWhitespaceAndComments();
@@ -792,20 +850,64 @@ const Parser = struct {
             var first_is_lit = false;
             var first_lit_val: Value = undefined;
             var first_nm: []const u8 = undefined;
-            if (self.parseIdentifier()) |nm| {
-                first_nm = nm;
+            // Support unary minus before identifier in projection by rewriting to 0 - ident
+            var forced_op_char: u8 = 0;
+            var forced_right_nm: ?[]const u8 = null;
+            var forced_right_qual: ?[]const u8 = null;
+            if (self.peek() == '-' and (self.pos + 1 < self.input.len) and isIdentStart(self.input[self.pos + 1])) {
+                // consume '-'
+                self.advance();
+                const id0 = self.parseIdentifier() orelse return ParseError.ParsingError;
+                var use_id = id0;
+                const save_after_id0 = self.pos;
+                self.skipWhitespaceAndComments();
+                if (self.matchChar('.')) {
+                    // qualified t.col
+                    forced_right_qual = id0;
+                    const colid = self.parseIdentifier() orelse return ParseError.ValidationError;
+                    self.skipWhitespaceAndComments();
+                    if (self.matchChar('.')) return ParseError.ValidationError;
+                    use_id = colid;
+                } else {
+                    self.pos = save_after_id0;
+                }
+                first_is_lit = true;
+                first_lit_val = Value{ .integer = 0 };
+                first_nm = "";
+                try left_qualifiers.append(null);
+                forced_op_char = '-';
+                forced_right_nm = use_id;
+            } else if (self.parseIdentifier()) |nm| {
+                var use_nm = nm;
+                var qual_tbl: ?[]const u8 = null;
+                const save_after_id = self.pos;
+                self.skipWhitespaceAndComments();
+                if (self.matchChar('.')) {
+                    qual_tbl = nm;
+                    const colid = self.parseIdentifier() orelse return ParseError.ValidationError;
+                    self.skipWhitespaceAndComments();
+                    if (self.matchChar('.')) return ParseError.ValidationError;
+                    use_nm = colid;
+                } else {
+                    self.pos = save_after_id;
+                }
+                first_nm = use_nm;
+                try left_qualifiers.append(qual_tbl);
             } else if (self.parseBoolean()) |b| {
                 first_is_lit = true;
                 first_lit_val = Value{ .boolean = b };
                 first_nm = "";
+                try left_qualifiers.append(null);
             } else if (self.parseInteger()) |n| {
                 first_is_lit = true;
                 first_lit_val = Value{ .integer = n };
                 first_nm = "";
+                try left_qualifiers.append(null);
             } else if (self.parseNull()) {
                 first_is_lit = true;
                 first_lit_val = Value.null;
                 first_nm = "";
+                try left_qualifiers.append(null);
             } else {
                 return ParseError.ParsingError;
             }
@@ -819,14 +921,31 @@ const Parser = struct {
             self.skipWhitespaceAndComments();
             var op_char: u8 = 0;
             var right_nm: ?[]const u8 = null;
+            var right_tbl_qual: ?[]const u8 = null;
             var right_is_lit_flag = false;
             var right_lit_val: Value = undefined;
             const c_after = self.peek();
-            if (c_after == '+' or c_after == '-' or c_after == '*' or c_after == '/') {
+            if (forced_op_char != 0) {
+                op_char = forced_op_char;
+                right_nm = forced_right_nm;
+                right_tbl_qual = forced_right_qual;
+            } else if (c_after == '+' or c_after == '-' or c_after == '*' or c_after == '/') {
                 op_char = c_after;
                 self.advance();
                 if (self.parseIdentifier()) |nm2| {
-                    right_nm = nm2;
+                    var use_r = nm2;
+                    const save_after_r = self.pos;
+                    self.skipWhitespaceAndComments();
+                    if (self.matchChar('.')) {
+                        right_tbl_qual = nm2;
+                        const colr = self.parseIdentifier() orelse return ParseError.ValidationError;
+                        self.skipWhitespaceAndComments();
+                        if (self.matchChar('.')) return ParseError.ValidationError;
+                        use_r = colr;
+                    } else {
+                        self.pos = save_after_r;
+                    }
+                    right_nm = use_r;
                 } else if (self.parseBoolean()) |b2| {
                     right_is_lit_flag = true;
                     right_lit_val = Value{ .boolean = b2 };
@@ -840,7 +959,19 @@ const Parser = struct {
             } else if (self.matchKeyword("and")) {
                 op_char = '&';
                 if (self.parseIdentifier()) |nm2| {
-                    right_nm = nm2;
+                    var use_r2 = nm2;
+                    const save_after_r2 = self.pos;
+                    self.skipWhitespaceAndComments();
+                    if (self.matchChar('.')) {
+                        right_tbl_qual = nm2;
+                        const colr2 = self.parseIdentifier() orelse return ParseError.ValidationError;
+                        self.skipWhitespaceAndComments();
+                        if (self.matchChar('.')) return ParseError.ValidationError;
+                        use_r2 = colr2;
+                    } else {
+                        self.pos = save_after_r2;
+                    }
+                    right_nm = use_r2;
                 } else if (self.parseBoolean()) |b2| {
                     right_is_lit_flag = true;
                     right_lit_val = Value{ .boolean = b2 };
@@ -855,7 +986,19 @@ const Parser = struct {
             } else if (self.matchKeyword("or")) {
                 op_char = '|';
                 if (self.parseIdentifier()) |nm2| {
-                    right_nm = nm2;
+                    var use_r3 = nm2;
+                    const save_after_r3 = self.pos;
+                    self.skipWhitespaceAndComments();
+                    if (self.matchChar('.')) {
+                        right_tbl_qual = nm2;
+                        const colr3 = self.parseIdentifier() orelse return ParseError.ValidationError;
+                        self.skipWhitespaceAndComments();
+                        if (self.matchChar('.')) return ParseError.ValidationError;
+                        use_r3 = colr3;
+                    } else {
+                        self.pos = save_after_r3;
+                    }
+                    right_nm = use_r3;
                 } else if (self.parseBoolean()) |b2| {
                     right_is_lit_flag = true;
                     right_lit_val = Value{ .boolean = b2 };
@@ -883,6 +1026,7 @@ const Parser = struct {
             try right_is_lit.append(right_is_lit_flag);
             // Maintain right_lits length equal to projection count
             try right_lits.append(if (right_is_lit_flag) right_lit_val else Value.null);
+            try right_qualifiers.append(right_tbl_qual);
 
             while (true) {
                 self.skipWhitespaceAndComments();
@@ -974,7 +1118,7 @@ const Parser = struct {
                 try right_lits.append(if (right2_is_lit) right2_lit else Value.null);
             }
             self.skipWhitespaceAndComments();
-            if (self.matchKeyword("from")) {
+                if (self.matchKeyword("from")) {
                 table_select = true;
                 const table_name = self.parseIdentifier() orelse return ParseError.ParsingError;
                 self.skipWhitespaceAndComments();
@@ -1003,6 +1147,7 @@ const Parser = struct {
                     var sub = Parser.init(self.input[where_start..]);
                     sub.eval_columns = tbl_preview.columns;
                     sub.eval_row = dummy_row;
+                    sub.eval_table_name = table_name;
                     const where_preview_val = sub.parseExpression() catch |err| return err;
                     sub.skipWhitespaceAndComments();
                     // Type check WHERE: must evaluate to boolean or null
@@ -1056,7 +1201,7 @@ const Parser = struct {
                         // we're still inside the ORDER BY expression (no ASC/DESC/LIMIT/OFFSET yet),
                         // then it's a parsing error (e.g., CLOCKWISE).
                         if (!order_clause_ends_here and isIdentStart(cnext)) return ParseError.ParsingError;
-                        const looks_like_expr = (cnext == '+' or cnext == '-' or cnext == '*' or cnext == '/' or cnext == '(' or cnext == '<' or cnext == '>' or cnext == '=' or isDigit(cnext));
+                        const looks_like_expr = (cnext == '+' or cnext == '-' or cnext == '*' or cnext == '/' or cnext == '(' or cnext == '<' or cnext == '>' or cnext == '=' or cnext == '.' or isDigit(cnext));
                         self.pos = save_ws;
                         if (!order_clause_ends_here and looks_like_expr) {
                             // Rewind and parse full expression instead
@@ -1072,6 +1217,7 @@ const Parser = struct {
                             }
                             sub2.eval_columns = tbl_preview2.columns;
                             sub2.eval_row = dummy_row2;
+                            sub2.eval_table_name = table_name;
                             _ = sub2.parseExpression() catch |err| return err;
                             sub2.skipWhitespaceAndComments();
                             const order_expr_len2 = sub2.pos;
@@ -1210,20 +1356,31 @@ const Parser = struct {
                     if (left_is_lit.items[i]) {
                         try col_indices.append(null);
                     } else {
+                        // If qualifier provided, it must match table_name
+                        if (left_qualifiers.items.len > i) {
+                            if (left_qualifiers.items[i]) |qn| {
+                                if (!std.ascii.eqlIgnoreCase(qn, table_name)) return ParseError.ValidationError;
+                            }
+                        }
                         const name = left_names.items[i];
                         var found: ?usize = null;
                         var ci: usize = 0;
                         while (ci < tbl.columns.len) : (ci += 1) {
-                            if (std.mem.eql(u8, tbl.columns[ci].name, name)) { found = ci; break; }
+                            if (std.ascii.eqlIgnoreCase(tbl.columns[ci].name, name)) { found = ci; break; }
                         }
                         if (found == null) return ParseError.ValidationError;
                         try col_indices.append(found);
                     }
                     if (proj_right_names.items[i]) |rn| {
+                        if (right_qualifiers.items.len > i) {
+                            if (right_qualifiers.items[i]) |rq| {
+                                if (!std.ascii.eqlIgnoreCase(rq, table_name)) return ParseError.ValidationError;
+                            }
+                        }
                         var f2: ?usize = null;
                         var cj: usize = 0;
                         while (cj < tbl.columns.len) : (cj += 1) {
-                            if (std.mem.eql(u8, tbl.columns[cj].name, rn)) { f2 = cj; break; }
+                            if (std.ascii.eqlIgnoreCase(tbl.columns[cj].name, rn)) { f2 = cj; break; }
                         }
                         if (f2 == null) return ParseError.ValidationError;
                         try right_indices.append(f2);
@@ -1277,6 +1434,7 @@ const Parser = struct {
                         var p = Parser.init(ws);
                         p.eval_columns = tbl.columns;
                         p.eval_row = row;
+                        p.eval_table_name = table_name;
                         const cond = p.parseExpression() catch |err| return err;
                         p.skipWhitespaceAndComments();
                         if (!p.eof()) return ParseError.ParsingError;
@@ -1355,6 +1513,7 @@ const Parser = struct {
                             var p3 = Parser.init(obs);
                             p3.eval_columns = tbl.columns;
                             p3.eval_row = base_row;
+                            p3.eval_table_name = table_name;
                             const kv = p3.parseExpression() catch |err| return err;
                             p3.skipWhitespaceAndComments();
                             if (!p3.eof()) return ParseError.ParsingError;

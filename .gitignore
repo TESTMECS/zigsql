@@ -1,6 +1,7 @@
 .passed_tests
 server_output.log
 server_error.log
+.zig_cache/
 __pycache__/
 *.pyc
 *.pyo

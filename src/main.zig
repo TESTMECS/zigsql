@@ -7,14 +7,12 @@
 //! - JSON response shape matches the test harness expectations:
 //!   - {"status":"ok","rows":[...],"column_names":[...]} for successful queries
 //!   - {"status":"error","error_type":"..."} for failures
-//! - Implemented features (focused on Chapters 2–6 of the kata):
 //!   - Expression SELECT without tables, with integers/booleans, arithmetic, logic,
 //!     comparisons (including `<>`), parentheses, and simple functions `ABS` and `MOD`.
 //!   - Minimal DDL/DML and storage: `CREATE TABLE`, `DROP TABLE [IF EXISTS]`,
 //!     `INSERT INTO t VALUES (...),(...);` and `SELECT col_list [AS alias] FROM table;`.
 //!   - Basic type checking for operators and functions, and division-by-zero detection.
 //! - In-memory catalog stores table definitions and rows using the server allocator.
-//!
 //! Notes & limitations (intentionally simple to satisfy the exercises):
 //! - No SQL quoting or string literals; identifiers are ASCII [A-Za-z_][A-Za-z0-9_]*.
 //! - Reserved keywords cannot be used as identifiers (but are allowed for aliases).
@@ -24,6 +22,7 @@
 //!   not yet complete; see tests in Chapter 6 for desired behavior.
 //! - The parser is intentionally permissive only for the covered grammar; anything else
 //!   returns `parsing_error`.
+//!
 const std = @import("std");
 
 // ---------------------------

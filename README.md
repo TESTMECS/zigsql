@@ -1,5 +1,7 @@
 # rgSQL
 
+> Made with ❤️ 
+
 <img alt="rgSQL logo" align=right width=159 height=187 src="https://technicaldeft.com/rgsql_logo_small.png"/> rgSQL is a SQL database server that **YOU** get to build from scratch.
 
 [More about rgSQL and why it was created](https://technicaldeft.com/posts/rgsql-a-test-suite-for-database-engines).

@@ -89,12 +89,12 @@ const ColumnDef = struct {
 const Table = struct {
     name: []const u8,
     columns: []ColumnDef,
-    rows: std.ArrayList([]Value),
+    rows: std.array_list.Managed([]Value),
 };
 
 /// In-memory catalog of tables. Single global instance per server process.
 const Database = struct {
-    tables: std.ArrayList(Table),
+    tables: std.array_list.Managed(Table),
 };
 
 var g_db_initialized: bool = false;
@@ -105,7 +105,7 @@ var g_db: Database = undefined;
 fn dbInit(allocator: std.mem.Allocator) void {
     if (!g_db_initialized) {
         g_db_allocator = allocator;
-        g_db = Database{ .tables = std.ArrayList(Table).init(allocator) };
+        g_db = Database{ .tables = std.array_list.Managed(Table).init(allocator) };
         g_db_initialized = true;
     }
 }
@@ -136,7 +136,7 @@ fn dbCreateTable(name: []const u8, cols: []const ColumnDef) ParseError!void {
     const name_copy = try g_db_allocator.dupe(u8, name);
 
     // copy columns and their names
-    var cols_list = std.ArrayList(ColumnDef).init(g_db_allocator);
+    var cols_list = std.array_list.Managed(ColumnDef).init(g_db_allocator);
     errdefer cols_list.deinit();
     for (cols) |c| {
         const name_cpy = try g_db_allocator.dupe(u8, c.name);
@@ -144,7 +144,7 @@ fn dbCreateTable(name: []const u8, cols: []const ColumnDef) ParseError!void {
     }
     const cols_slice = try cols_list.toOwnedSlice();
 
-    try g_db.tables.append(.{ .name = name_copy, .columns = cols_slice, .rows = std.ArrayList([]Value).init(g_db_allocator) });
+    try g_db.tables.append(.{ .name = name_copy, .columns = cols_slice, .rows = std.array_list.Managed([]Value).init(g_db_allocator) });
 }
 
 /// Drop a table and free its memory. Returns `validation_error` when the table
@@ -375,7 +375,7 @@ const Parser = struct {
             self.skipWhitespaceAndComments();
             if (self.matchChar('(')) {
                 // parse 0..N args separated by commas, allow whitespace
-                var args = std.ArrayList(Value).init(std.heap.page_allocator);
+                var args = std.array_list.Managed(Value).init(std.heap.page_allocator);
                 defer args.deinit();
                 self.skipWhitespaceAndComments();
                 if (!self.matchChar(')')) {
@@ -793,7 +793,7 @@ const Parser = struct {
     /// detection.
     fn parseSelectList(self: *Parser, arena: std.mem.Allocator) ParseError![]SelectItem {
         self.skipWhitespaceAndComments();
-        var list = std.ArrayList(SelectItem).init(arena);
+        var list = std.array_list.Managed(SelectItem).init(arena);
         errdefer list.deinit();
 
         // handle empty select list (e.g. SELECT;)
@@ -892,26 +892,26 @@ const Parser = struct {
 
         // Lookahead path: try parsing identifier list (with optional aliases and simple ops) followed by FROM
         save_items = self.pos;
-        var left_names = std.ArrayList([]const u8).init(arena);
+        var left_names = std.array_list.Managed([]const u8).init(arena);
         errdefer left_names.deinit();
-        var out_names = std.ArrayList([]const u8).init(arena);
+        var out_names = std.array_list.Managed([]const u8).init(arena);
         errdefer out_names.deinit();
-        var proj_ops = std.ArrayList(u8).init(arena); // 0 none, '+','-','*','/','&' (and),'|' (or)
+        var proj_ops = std.array_list.Managed(u8).init(arena); // 0 none, '+','-','*','/','&' (and),'|' (or)
         errdefer proj_ops.deinit();
-        var proj_right_names = std.ArrayList(?[]const u8).init(arena);
+        var proj_right_names = std.array_list.Managed(?[]const u8).init(arena);
         errdefer proj_right_names.deinit();
-        var left_is_lit = std.ArrayList(bool).init(arena);
+        var left_is_lit = std.array_list.Managed(bool).init(arena);
         errdefer left_is_lit.deinit();
-        var left_lits = std.ArrayList(Value).init(arena);
+        var left_lits = std.array_list.Managed(Value).init(arena);
         errdefer left_lits.deinit();
-        var right_is_lit = std.ArrayList(bool).init(arena);
+        var right_is_lit = std.array_list.Managed(bool).init(arena);
         errdefer right_is_lit.deinit();
-        var right_lits = std.ArrayList(Value).init(arena);
+        var right_lits = std.array_list.Managed(Value).init(arena);
         errdefer right_lits.deinit();
         // Optional table qualifiers for identifiers (e.g., t1.a)
-        var left_qualifiers = std.ArrayList(?[]const u8).init(arena);
+        var left_qualifiers = std.array_list.Managed(?[]const u8).init(arena);
         errdefer left_qualifiers.deinit();
-        var right_qualifiers = std.ArrayList(?[]const u8).init(arena);
+        var right_qualifiers = std.array_list.Managed(?[]const u8).init(arena);
         errdefer right_qualifiers.deinit();
 
         var table_select = false;
@@ -1490,9 +1490,9 @@ const Parser = struct {
                 const tbl = g_db.tables.items[t_idx];
 
                 // Resolve and pre-validate only for non-join simple table selects
-                var col_indices = std.ArrayList(?usize).init(arena);
+                var col_indices = std.array_list.Managed(?usize).init(arena);
                 errdefer col_indices.deinit();
-                var right_indices = std.ArrayList(?usize).init(arena);
+                var right_indices = std.array_list.Managed(?usize).init(arena);
                 errdefer right_indices.deinit();
                 if (join_type == .none) {
                     var i: usize = 0;
@@ -1563,9 +1563,9 @@ const Parser = struct {
                 }
 
                 // Build result rows
-                var result_rows = std.ArrayList([]Value).init(arena);
+                var result_rows = std.array_list.Managed([]Value).init(arena);
                 errdefer result_rows.deinit();
-                var source_row_indices = std.ArrayList(usize).init(arena);
+                var source_row_indices = std.array_list.Managed(usize).init(arena);
                 errdefer source_row_indices.deinit();
 
                 if (join_type == .none) {
@@ -1595,7 +1595,7 @@ const Parser = struct {
                         ps.eval_table_name = table_name;
                         const items_eval = ps.parseSelectList(arena) catch |err| return err;
                         if (ps.had_division_by_zero) return ParseError.DivisionByZero;
-                        var out = std.ArrayList(Value).init(arena);
+                        var out = std.array_list.Managed(Value).init(arena);
                         errdefer out.deinit();
                         for (items_eval) |it| try out.append(it.expr);
                         try source_row_indices.append(row_index);
@@ -1670,7 +1670,7 @@ const Parser = struct {
                                     ps.eval_join_ctx = &ctxs3;
                                     const items_eval = ps.parseSelectList(arena) catch |err| return err;
                                     if (ps.had_division_by_zero) return ParseError.DivisionByZero;
-                                    var out = std.ArrayList(Value).init(arena);
+                                    var out = std.array_list.Managed(Value).init(arena);
                                     errdefer out.deinit();
                                     for (items_eval) |it| try out.append(it.expr);
                                     try result_rows.append(try out.toOwnedSlice());
@@ -1704,7 +1704,7 @@ const Parser = struct {
                                 ps.eval_join_ctx = &ctxs3;
                                 const items_eval = ps.parseSelectList(arena) catch |err| return err;
                                 if (ps.had_division_by_zero) return ParseError.DivisionByZero;
-                                var out = std.ArrayList(Value).init(arena);
+                                var out = std.array_list.Managed(Value).init(arena);
                                 errdefer out.deinit();
                                 for (items_eval) |it| try out.append(it.expr);
                                 try result_rows.append(try out.toOwnedSlice());
@@ -1743,7 +1743,7 @@ const Parser = struct {
                                 ps.eval_join_ctx = &ctxs3;
                                 const items_eval = ps.parseSelectList(arena) catch |err| return err;
                                 if (ps.had_division_by_zero) return ParseError.DivisionByZero;
-                                var out = std.ArrayList(Value).init(arena);
+                                var out = std.array_list.Managed(Value).init(arena);
                                 errdefer out.deinit();
                                 for (items_eval) |it| try out.append(it.expr);
                                 try result_rows.append(try out.toOwnedSlice());
@@ -1755,7 +1755,7 @@ const Parser = struct {
                 // ORDER BY
                 if (order_by_alias != null or order_by_expr_slice != null) {
                     // Build keys for sorting
-                    var keys = std.ArrayList(Value).init(arena);
+                    var keys = std.array_list.Managed(Value).init(arena);
                     errdefer keys.deinit();
                     var alias_idx: ?usize = null;
                     if (order_by_alias) |alias_name| {
@@ -1839,7 +1839,7 @@ const Parser = struct {
                         pub fn lessThan(info: Cmp, ai: usize, bi: usize) bool { return info.lt(ai, bi); }
                     }.lessThan);
                     // reorder result_rows according to order_indices
-                    var sorted_rows = std.ArrayList([]Value).init(arena);
+                    var sorted_rows = std.array_list.Managed([]Value).init(arena);
                     errdefer sorted_rows.deinit();
                     var si: usize = 0;
                     while (si < order_indices.len) : (si += 1) {
@@ -1884,7 +1884,7 @@ const Parser = struct {
                     end_idx = if (lim_end < total) lim_end else total;
                 }
                 // Build final slice
-                var final_rows = std.ArrayList([]Value).init(arena);
+                var final_rows = std.array_list.Managed([]Value).init(arena);
                 errdefer final_rows.deinit();
                 var ri: usize = start_idx;
                 while (ri < end_idx) : (ri += 1) {
@@ -1925,7 +1925,7 @@ const Parser = struct {
         self.skipWhitespaceAndComments();
         if (!self.matchChar('(')) return ParseError.ParsingError;
 
-        var cols = std.ArrayList(ColumnDef).init(std.heap.page_allocator);
+        var cols = std.array_list.Managed(ColumnDef).init(std.heap.page_allocator);
         defer cols.deinit();
 
         var seen_names = std.StringHashMap(void).init(std.heap.page_allocator);
@@ -2016,14 +2016,14 @@ const Parser = struct {
         var tbl = &g_db.tables.items[t_idx];
 
         // Stage rows here; commit to `tbl.rows` only after full success.
-        var staged_rows = std.ArrayList([]Value).init(arena);
+        var staged_rows = std.array_list.Managed([]Value).init(arena);
         defer staged_rows.deinit();
 
         var any_rows = false;
         while (true) {
             if (!self.matchChar('(')) return ParseError.ParsingError;
             // parse one row values list
-            var values = std.ArrayList(Value).init(std.heap.page_allocator);
+            var values = std.array_list.Managed(Value).init(std.heap.page_allocator);
             defer values.deinit();
             var first = true;
             while (true) {
@@ -2146,7 +2146,7 @@ fn jsonWriteStringEscaped(writer: anytype, s: []const u8) !void {
 /// Serialize a `QueryResult` into a JSON object that matches the test runner
 /// contract. Only the keys required by the harness are emitted.
 fn buildJsonResponse(allocator: std.mem.Allocator, result: QueryResult) ![]u8 {
-    var buf = std.ArrayList(u8).init(allocator);
+    var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
     var w = buf.writer();
 
@@ -2276,15 +2276,14 @@ fn handleQuery(allocator: std.mem.Allocator, msg: []const u8) ![]u8 {
 /// Read null-terminated statements from a client connection, write back JSON
 /// responses, and continue until the client closes the connection.
 fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connection) !void {
-    var message_buffer = std.ArrayList(u8).init(allocator);
+    var message_buffer = std.array_list.Managed(u8).init(allocator);
     defer message_buffer.deinit();
 
     var read_buffer: [4096]u8 = undefined;
-    const reader = conn.stream.reader();
-    const writer = conn.stream.writer();
+    var net_writer = conn.stream.writer(&.{});
 
     while (true) {
-        const bytes_read = reader.read(&read_buffer) catch |err| switch (err) {
+        const bytes_read = conn.stream.read(&read_buffer) catch |err| switch (err) {
             error.ConnectionResetByPeer => break,
             else => return err,
         };
@@ -2304,8 +2303,8 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
                 defer allocator.free(response_json);
 
                 // Write response plus trailing null
-                try writer.writeAll(response_json);
-                try writer.writeByte(0);
+                try net_writer.interface.writeAll(response_json);
+                try net_writer.interface.writeByte(0);
 
                 // Remove processed message (including the null) from the buffer
                 const remaining_start = nul_index + 1;

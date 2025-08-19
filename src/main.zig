@@ -1211,9 +1211,11 @@ const Parser = struct {
                 var on_slice: ?[]const u8 = null;
                 const after_from_before_join = self.pos;
                 const try_join_pos = self.pos;
-                const t_idx_preview_left = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
-                const tbl_preview_left = g_db.tables.items[t_idx_preview_left];
+                const t_idx_preview_left_opt = dbFindTableIndex(table_name);
                 if (self.matchKeyword("inner") or self.matchKeyword("left") or self.matchKeyword("right") or self.matchKeyword("full")) {
+                    // If a JOIN is specified but the left table does not exist, surface validation error
+                    const t_idx_preview_left = t_idx_preview_left_opt orelse return ParseError.ValidationError;
+                    const tbl_preview_left = g_db.tables.items[t_idx_preview_left];
                     // Determine join_type from last matched keyword
                     const matched = self.input[try_join_pos..self.pos];
                     if (std.ascii.eqlIgnoreCase(matched, "inner")) join_type = .inner;
@@ -1238,7 +1240,7 @@ const Parser = struct {
                     }
                     if (!self.matchKeyword("on")) return ParseError.ParsingError;
                     // Build eval ctx to parse ON expression without validation errors
-                    const t_idx_preview_right = dbFindTableIndex(join_table_name) orelse return ParseError.ValidationError;
+                    const t_idx_preview_right = dbFindTableIndex(join_table_name) orelse return ParseError.ParsingError;
                     const tbl_preview_right = g_db.tables.items[t_idx_preview_right];
                     var dummy_left = try arena.alloc(Value, tbl_preview_left.columns.len);
                     defer arena.free(dummy_left);
@@ -1310,8 +1312,39 @@ const Parser = struct {
                 if (self.matchKeyword("order")) {
                     if (!self.matchKeyword("by")) return ParseError.ParsingError;
                     self.skipWhitespaceAndComments();
-                    // Try bare identifier (could be alias or column). If found, treat as minimal expression slice
                     const expr_start = self.pos;
+                    // Hard check for missing expression: ORDER BY ASC|DESC
+                    if (self.pos + 3 <= self.input.len) {
+                        const a = std.ascii.toLower(self.input[self.pos]);
+                        const b = if (self.pos + 1 < self.input.len) std.ascii.toLower(self.input[self.pos + 1]) else 0;
+                        const c = if (self.pos + 2 < self.input.len) std.ascii.toLower(self.input[self.pos + 2]) else 0;
+                        if (a == 'a' and b == 's' and c == 'c') {
+                            const after = self.pos + 3;
+                            if (after >= self.input.len or !isIdentChar(self.input[after])) return ParseError.ParsingError;
+                        }
+                        if (self.pos + 4 <= self.input.len) {
+                            const d = if (self.pos + 3 < self.input.len) std.ascii.toLower(self.input[self.pos + 3]) else 0;
+                            if (a == 'd' and b == 'e' and c == 's' and d == 'c') {
+                                const after2 = self.pos + 4;
+                                if (after2 >= self.input.len or !isIdentChar(self.input[after2])) return ParseError.ParsingError;
+                            }
+                        }
+                    }
+                    // Early sanity: ensure next token can start an expression and is not just ASC/DESC
+                    if (self.eof()) return ParseError.ParsingError;
+                    const cstart = self.peek();
+                    if (isIdentStart(cstart)) {
+                        const save_chk = self.pos;
+                        if (self.parseIdentifier()) |tok| {
+                            if (std.ascii.eqlIgnoreCase(tok, "asc") or std.ascii.eqlIgnoreCase(tok, "desc")) {
+                                return ParseError.ParsingError;
+                            }
+                        }
+                        self.pos = save_chk;
+                    } else if (!(isDigit(cstart) or cstart == '(' or cstart == '-' )) {
+                        return ParseError.ParsingError;
+                    }
+                    // Try bare identifier (could be alias or column). If found, treat as minimal expression slice
                     // If the next token is ASC/DESC directly, treat as missing expression
                     const save_after_by = self.pos;
                     if (self.matchKeyword("asc") or self.matchKeyword("desc")) {
@@ -1323,6 +1356,15 @@ const Parser = struct {
                     self.pos = save_after_by;
                     const save_ob = self.pos;
                     if (self.parseIdentifier()) |maybe_ident| {
+                        // Immediately after BY, an identifier that is actually a reserved keyword
+                        // such as ASC/DESC must be rejected as missing expression
+                        if (std.ascii.eqlIgnoreCase(maybe_ident, "asc") or std.ascii.eqlIgnoreCase(maybe_ident, "desc")) {
+                            return ParseError.ParsingError;
+                        }
+                        // If the first token after ORDER BY is a direction keyword, it's a parse error
+                        if (std.ascii.eqlIgnoreCase(maybe_ident, "asc") or std.ascii.eqlIgnoreCase(maybe_ident, "desc")) {
+                            return ParseError.ParsingError;
+                        }
                         // After an identifier, decide if this is a simple identifier ORDER BY
                         // or the start of a larger expression (e.g., ident + 2).
                         const ident_end = self.pos;
@@ -1424,6 +1466,17 @@ const Parser = struct {
                     } else {
                         self.pos = save_dir;
                         order_desc = false; // default ASC
+                    }
+                    // Special-case: ORDER BY ASC|DESC with no expression should be a parse error
+                    if (order_by_expr_slice == null and order_by_alias != null) {
+                        const alias_nm_chk = order_by_alias.?;
+                        if (std.ascii.eqlIgnoreCase(alias_nm_chk, "asc") or std.ascii.eqlIgnoreCase(alias_nm_chk, "desc")) {
+                            return ParseError.ParsingError;
+                        }
+                    }
+                    // If we still have no expression or alias, it's a parse error (missing expression)
+                    if (order_by_expr_slice == null and order_by_alias == null) {
+                        return ParseError.ParsingError;
                     }
                     self.skipWhitespaceAndComments();
                     // After ORDER BY expression and optional direction, only LIMIT/OFFSET or ';' may follow
@@ -1798,8 +1851,8 @@ const Parser = struct {
                             if (kv != .integer and kv != .boolean and kv != .null) return ParseError.ValidationError;
                             key = kv;
                         } else {
-                            // Alias requested but not found -> validation error
-                            return ParseError.ValidationError;
+                            // No expression slice and no resolvable alias: treat as missing ORDER BY expression
+                            return ParseError.ParsingError;
                         }
                         try keys.append(key);
                     }

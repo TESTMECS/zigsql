@@ -135,19 +135,35 @@ fn dbFindTableIndex(name: []const u8) ?usize {
 fn dbCreateTable(name: []const u8, cols: []const ColumnDef) ParseError!void {
     if (dbFindTableIndex(name)) |_| return ParseError.ValidationError; // already exists
 
-    // copy name
+    // Reserve space in the main tables list first.
+    try g_db.tables.ensureUnusedCapacity(1);
+    // Reserve memory for the table name.
     const name_copy = try g_db_allocator.dupe(u8, name);
-
+    errdefer g_db_allocator.free(name_copy); // Clean up if anything below fails.
+                                             
     // copy columns and their names
-    var cols_list = std.array_list.Managed(ColumnDef).init(g_db_allocator);
-    errdefer cols_list.deinit();
-    for (cols) |c| {
-        const name_cpy = try g_db_allocator.dupe(u8, c.name);
-        try cols_list.append(.{ .name = name_cpy, .typ = c.typ });
-    }
-    const cols_slice = try cols_list.toOwnedSlice();
+    const cols_copy = try g_db_allocator.alloc(ColumnDef, cols.len);
+    errdefer g_db_allocator.free(cols_copy);
 
-    try g_db.tables.append(.{ .name = name_copy, .columns = cols_slice, .rows = std.array_list.Managed([]Value).init(g_db_allocator) });
+     // This loop is tricky. If an allocation fails on the 3rd column, we
+    // need to free the names for the 1st and 2nd columns.
+    for (cols, 0..) |c, i| {
+        // This errdefer will clean up previously allocated column names
+        // if the current `dupe` call fails.
+        errdefer {
+            for (cols_copy[0..i]) |col_to_free| {
+                g_db_allocator.free(col_to_free.name);
+            }
+        }
+        const name_cpy = try g_db_allocator.dupe(u8, c.name);
+        cols_copy[i] = .{ .name = name_cpy, .typ = c.typ };
+    }
+    // This is our guard. We promise the compiler no errors can happen after this point. 
+    errdefer comptime unreachable;
+    // Now the Mutation Path is error Free :)
+
+    // Commit the database table state!
+    g_db.tables.appendAssumeCapacity(.{ .name = name_copy, .columns = cols_copy, .rows = std.array_list.Managed([]Value).init(g_db_allocator) });
 }
 
 /// Drop a table and free its memory. Returns `validation_error` when the table

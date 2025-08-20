@@ -984,6 +984,18 @@ const Parser = struct {
                 } else {
                     self.pos = save_after_id;
                 }
+                // If identifier is followed by a parenthesis, skip the function argument list for slicing purposes
+                self.skipWhitespaceAndComments();
+                if (self.peek() == '(') {
+                    // consume balanced parentheses
+                    var depth: usize = 0;
+                    while (!self.eof()) {
+                        const ch = self.peek();
+                        if (ch == '(') { depth += 1; self.advance(); continue; }
+                        if (ch == ')') { self.advance(); if (depth == 0) break; depth -= 1; if (depth == 0) break; continue; }
+                        self.advance();
+                    }
+                }
                 first_nm = use_nm;
                 try left_qualifiers.append(qual_tbl);
             } else if (self.parseBoolean()) |b| {
@@ -1037,6 +1049,17 @@ const Parser = struct {
                         use_r = colr;
                     } else {
                         self.pos = save_after_r;
+                    }
+                    // If identifier is followed by a parenthesis, skip balanced parentheses (function call)
+                    self.skipWhitespaceAndComments();
+                    if (self.peek() == '(') {
+                        var depthf: usize = 0;
+                        while (!self.eof()) {
+                            const chf = self.peek();
+                            if (chf == '(') { depthf += 1; self.advance(); continue; }
+                            if (chf == ')') { self.advance(); if (depthf == 0) break; depthf -= 1; if (depthf == 0) break; continue; }
+                            self.advance();
+                        }
                     }
                     right_nm = use_r;
                 } else if (self.parseBoolean()) |b2| {
@@ -1141,6 +1164,17 @@ const Parser = struct {
                         use_nm2 = colid2;
                     } else {
                         self.pos = save_after_id2;
+                    }
+                    // If identifier is followed by a parenthesis, skip balanced parentheses
+                    self.skipWhitespaceAndComments();
+                    if (self.peek() == '(') {
+                        var depth2: usize = 0;
+                        while (!self.eof()) {
+                            const ch2 = self.peek();
+                            if (ch2 == '(') { depth2 += 1; self.advance(); continue; }
+                            if (ch2 == ')') { self.advance(); if (depth2 == 0) break; depth2 -= 1; if (depth2 == 0) break; continue; }
+                            self.advance();
+                        }
                     }
                     nm = use_nm2;
                 } else if (self.parseBoolean()) |b| {
@@ -1272,6 +1306,16 @@ const Parser = struct {
                 // Capture the original select list slice for expression-based projection evaluation per row
                 const select_list_start = save_items;
                 const select_list_slice: []const u8 = self.input[select_list_start..select_list_end_pos];
+                // Detect if select list contains function calls by scanning until FROM
+                const from_pos_opt = scanKeywordForward(self.input, select_list_start, "from") orelse select_list_end_pos;
+                const select_contains_paren = blk_paren: {
+                    var i: usize = select_list_start;
+                    var found = false;
+                    while (i < from_pos_opt) : (i += 1) {
+                        if (self.input[i] == '(') { found = true; break; }
+                    }
+                    break :blk_paren found;
+                };
 
                 // Parse optional JOIN
                 var join_type: JoinType = .none;
@@ -1357,8 +1401,9 @@ const Parser = struct {
                     self.pos = after_from_before_join;
                 }
 
-                // Optional clauses: WHERE, ORDER BY, LIMIT/OFFSET, then ';'
+                // Optional clauses: WHERE, GROUP BY, ORDER BY, LIMIT/OFFSET, then ';'
                 var where_slice: ?[]const u8 = null;
+                var group_by_expr_slice: ?[]const u8 = null;
                 var order_by_alias: ?[]const u8 = null;
                 var order_by_expr_slice: ?[]const u8 = null;
                 var order_desc = false;
@@ -1434,8 +1479,229 @@ const Parser = struct {
                     self.pos = after_from_pos;
                 }
 
-                // ORDER BY
+                // GROUP BY
                 const after_where_pos = self.pos;
+                if (self.matchKeyword("group")) {
+                    if (!self.matchKeyword("by")) return ParseError.ParsingError;
+                    const gb_start = self.pos;
+                    if (join_type == .none) {
+                        // Single-table context
+                        const t_idx_preview = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                        const tbl_preview = g_db.tables.items[t_idx_preview];
+                        var dummy_row = try arena.alloc(Value, tbl_preview.columns.len);
+                        defer arena.free(dummy_row);
+                        var gi: usize = 0; while (gi < tbl_preview.columns.len) : (gi += 1) {
+                            dummy_row[gi] = switch (tbl_preview.columns[gi].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                        }
+                        var pgb = Parser.init(self.input[gb_start..]);
+                        pgb.eval_columns = tbl_preview.columns;
+                        pgb.eval_row = dummy_row;
+                        pgb.eval_table_name = table_name;
+                        _ = pgb.parseExpression() catch |err| return err;
+                        pgb.skipWhitespaceAndComments();
+                        const gb_len = pgb.pos;
+                        if (gb_len == 0) return ParseError.ParsingError;
+                        group_by_expr_slice = self.input[gb_start .. gb_start + gb_len];
+                        self.pos = gb_start + gb_len;
+                        self.skipWhitespaceAndComments();
+                    } else {
+                        // Join context
+                        const t_idx_left = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                        const t_idx_right = dbFindTableIndex(join_table_name) orelse return ParseError.ValidationError;
+                        const tbl_left = g_db.tables.items[t_idx_left];
+                        const tbl_right = g_db.tables.items[t_idx_right];
+                        var dummy_left = try arena.alloc(Value, tbl_left.columns.len);
+                        defer arena.free(dummy_left);
+                        var dummy_right = try arena.alloc(Value, tbl_right.columns.len);
+                        defer arena.free(dummy_right);
+                        var il2: usize = 0; while (il2 < dummy_left.len) : (il2 += 1) {
+                            dummy_left[il2] = switch (tbl_left.columns[il2].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                        }
+                        var ir2: usize = 0; while (ir2 < dummy_right.len) : (ir2 += 1) {
+                            dummy_right[ir2] = switch (tbl_right.columns[ir2].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                        }
+                        var pgb = Parser.init(self.input[gb_start..]);
+                        var ctxs_gb = [_]EvalTableCtx{
+                            .{ .table_name = table_name, .alias = null, .columns = tbl_left.columns, .row = dummy_left },
+                            .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_right.columns, .row = dummy_right },
+                        };
+                        pgb.eval_join_ctx = &ctxs_gb;
+                        _ = pgb.parseExpression() catch |err| return err;
+                        pgb.skipWhitespaceAndComments();
+                        const gb_len = pgb.pos;
+                        if (gb_len == 0) return ParseError.ParsingError;
+                        group_by_expr_slice = self.input[gb_start .. gb_start + gb_len];
+                        self.pos = gb_start + gb_len;
+                        self.skipWhitespaceAndComments();
+                    }
+
+                    // Build identifier sets by scanning tokens and matching against table column names
+                    const cols_left = blk1: {
+                        const idx = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                        break :blk1 g_db.tables.items[idx].columns;
+                    };
+                    const cols_right = if (join_type == .none) cols_left else blk2: {
+                        const idxr = dbFindTableIndex(join_table_name) orelse return ParseError.ValidationError;
+                        break :blk2 g_db.tables.items[idxr].columns;
+                    };
+                    // collect group-by idents
+                    var gb_idents = std.array_list.Managed([]const u8).init(arena);
+                    errdefer gb_idents.deinit();
+                    var pi: usize = 0;
+                    while (pi < group_by_expr_slice.?.len) {
+                        const savep = pi;
+                        if (nextIdent(group_by_expr_slice.?, &pi)) |ident| {
+                            // handle qualified t.col
+                            var j = pi;
+                            while (j < group_by_expr_slice.?.len and (group_by_expr_slice.?[j] == ' ' or group_by_expr_slice.?[j] == '\n' or group_by_expr_slice.?[j] == '\r' or group_by_expr_slice.?[j] == '\t')) : (j += 1) {}
+                            // If function call like ABS(...), step into args to find identifiers
+                            if (j < group_by_expr_slice.?.len and group_by_expr_slice.?[j] == '(') {
+                                pi = j + 1;
+                                continue;
+                            }
+                            if (j < group_by_expr_slice.?.len and group_by_expr_slice.?[j] == '.') {
+                                // read column ident
+                                j += 1;
+                                var pos2: usize = j;
+                                if (nextIdent(group_by_expr_slice.?, &pos2)) |colid| {
+                                    if (identIsColumn(colid, cols_left, if (join_type == .none) cols_left else cols_right)) try gb_idents.append(colid);
+                                    pi = pos2;
+                                } else {
+                                    pi = pos2;
+                                }
+                            } else {
+                                if (identIsColumn(ident, cols_left, if (join_type == .none) cols_left else cols_right)) try gb_idents.append(ident);
+                            }
+                        } else {
+                            pi = savep + 1;
+                        }
+                    }
+                    // Static validation (only for simple column projections): each bare column in SELECT must be in GROUP BY
+                    var si: usize = 0;
+                    while (si < left_names.items.len) : (si += 1) {
+                        if (proj_ops.items[si] == 0 and !left_is_lit.items[si] and proj_right_names.items[si] == null) {
+                            const idn = left_names.items[si];
+                            // When select_list contains a function call, allow columns not explicitly listed in group-by,
+                            // because the expression itself may be function of the group-by (e.g., ABS(a) grouped by ABS(a)).
+                            if (!select_contains_paren and identIsColumn(idn, cols_left, cols_right) and !inSet(gb_idents.items, idn)) return ParseError.ValidationError;
+                        }
+                    }
+
+                    // When select has expressions, ensure any column references appear only within the group-by expression
+                    if (select_contains_paren) {
+                        // Normalize helper: write lowercased, remove whitespace, drop table qualifier before '.'
+                        var sel_norm = std.array_list.Managed(u8).init(arena);
+                        errdefer sel_norm.deinit();
+                        var psel: usize = 0;
+                        while (psel < select_list_slice.len) {
+                            const ch = select_list_slice[psel];
+                            // skip whitespace
+                            if (ch == ' ' or ch == '\n' or ch == '\r' or ch == '\t') { psel += 1; continue; }
+                            if (Parser.isIdentStart(ch)) {
+                                var tmp = psel;
+                                if (nextIdent(select_list_slice, &tmp)) |idtok| {
+                                    // Check for qualifier
+                                    var j = tmp;
+                                    while (j < select_list_slice.len and (select_list_slice[j] == ' ' or select_list_slice[j] == '\n' or select_list_slice[j] == '\r' or select_list_slice[j] == '\t')) : (j += 1) {}
+                                    if (j < select_list_slice.len and select_list_slice[j] == '.') {
+                                        j += 1;
+                                        var pos2: usize = j;
+                                        const coltok = nextIdent(select_list_slice, &pos2) orelse idtok;
+                                        // write column token lowercased
+                                        var k: usize = 0;
+                                        while (k < coltok.len) : (k += 1) try sel_norm.append(std.ascii.toLower(coltok[k]));
+                                        psel = pos2;
+                                        continue;
+                                    } else {
+                                        // write identifier lowercased
+                                        var k2: usize = 0;
+                                        while (k2 < idtok.len) : (k2 += 1) try sel_norm.append(std.ascii.toLower(idtok[k2]));
+                                        psel = tmp;
+                                        continue;
+                                    }
+                                }
+                            }
+                            // default: copy non-space char
+                            try sel_norm.append(ch);
+                            psel += 1;
+                        }
+
+                        var gb_norm = std.array_list.Managed(u8).init(arena);
+                        errdefer gb_norm.deinit();
+                        var pgb2: usize = 0;
+                        while (pgb2 < group_by_expr_slice.?.len) {
+                            const ch2 = group_by_expr_slice.?[pgb2];
+                            if (ch2 == ' ' or ch2 == '\n' or ch2 == '\r' or ch2 == '\t') { pgb2 += 1; continue; }
+                            if (Parser.isIdentStart(ch2)) {
+                                var t2 = pgb2;
+                                if (nextIdent(group_by_expr_slice.?, &t2)) |id2| {
+                                    var j2 = t2;
+                                    while (j2 < group_by_expr_slice.?.len and (group_by_expr_slice.?[j2] == ' ' or group_by_expr_slice.?[j2] == '\n' or group_by_expr_slice.?[j2] == '\r' or group_by_expr_slice.?[j2] == '\t')) : (j2 += 1) {}
+                                    if (j2 < group_by_expr_slice.?.len and group_by_expr_slice.?[j2] == '.') {
+                                        j2 += 1;
+                                        var pos22: usize = j2;
+                                        const col2 = nextIdent(group_by_expr_slice.?, &pos22) orelse id2;
+                                        var kk: usize = 0; while (kk < col2.len) : (kk += 1) try gb_norm.append(std.ascii.toLower(col2[kk]));
+                                        pgb2 = pos22;
+                                        continue;
+                                    } else {
+                                        var kk2: usize = 0; while (kk2 < id2.len) : (kk2 += 1) try gb_norm.append(std.ascii.toLower(id2[kk2]));
+                                        pgb2 = t2;
+                                        continue;
+                                    }
+                                }
+                            }
+                            try gb_norm.append(ch2);
+                            pgb2 += 1;
+                        }
+
+                        // Mark coverage of group-by expr occurrences in normalized select string
+                        const sel_s = sel_norm.items;
+                        const gb_s = gb_norm.items;
+                        var covered = try arena.alloc(bool, sel_s.len);
+                        var ci: usize = 0; while (ci < sel_s.len) : (ci += 1) covered[ci] = false;
+                        if (gb_s.len > 0 and gb_s.len <= sel_s.len) {
+                            var iFind: usize = 0;
+                            outer: while (iFind + gb_s.len <= sel_s.len) : (iFind += 1) {
+                                var m: usize = 0;
+                                while (m < gb_s.len) : (m += 1) {
+                                    if (sel_s[iFind + m] != gb_s[m]) continue :outer;
+                                }
+                                // match found
+                                var f: usize = 0;
+                                while (f < gb_s.len) : (f += 1) covered[iFind + f] = true;
+                            }
+                        }
+
+                        // Scan normalized select for column identifiers that are not fully inside any covered region
+                        var scan: usize = 0;
+                        while (scan < sel_s.len) {
+                            const ch3 = sel_s[scan];
+                            if (Parser.isIdentStart(ch3)) {
+                                const start_tok = scan;
+                                scan += 1;
+                                while (scan < sel_s.len and Parser.isIdentChar(sel_s[scan])) : (scan += 1) {}
+                                const tok = sel_s[start_tok..scan];
+                                // If this token is a column name, ensure its span is covered somewhere
+                                if (identIsColumn(tok, cols_left, cols_right)) {
+                                    var all_cov = true;
+                                    var kci: usize = start_tok;
+                                    while (kci < scan) : (kci += 1) {
+                                        if (!covered[kci]) { all_cov = false; break; }
+                                    }
+                                    if (!all_cov) return ParseError.ValidationError;
+                                }
+                                continue;
+                            }
+                            scan += 1;
+                        }
+                    }
+                } else {
+                    self.pos = after_where_pos;
+                }
+
+                // ORDER BY
+                const after_group_pos = self.pos;
                 if (self.matchKeyword("order")) {
                     if (!self.matchKeyword("by")) return ParseError.ParsingError;
                     self.skipWhitespaceAndComments();
@@ -1615,7 +1881,7 @@ const Parser = struct {
                     self.pos = save_extra;
                     self.skipWhitespaceAndComments();
                 } else {
-                    self.pos = after_where_pos;
+                    self.pos = after_group_pos;
                 }
 
                 // LIMIT/OFFSET (either order)
@@ -1674,7 +1940,7 @@ const Parser = struct {
                 errdefer col_indices.deinit();
                 var right_indices = std.array_list.Managed(?usize).init(arena);
                 errdefer right_indices.deinit();
-                if (join_type == .none) {
+                if (join_type == .none and !select_contains_paren) {
                     var i: usize = 0;
                     while (i < left_names.items.len) : (i += 1) {
                         if (left_is_lit.items[i]) {
@@ -1751,6 +2017,9 @@ const Parser = struct {
                 errdefer result_rows.deinit();
                 var source_row_indices = std.array_list.Managed(usize).init(arena);
                 errdefer source_row_indices.deinit();
+                // When grouping, track unique keys to emit one row per group
+                var group_keys = std.array_list.Managed(Value).init(arena);
+                errdefer group_keys.deinit();
 
                 if (join_type == .none) {
                     var row_index: usize = 0;
@@ -1772,6 +2041,23 @@ const Parser = struct {
                                 else => return ParseError.ValidationError,
                             }
                         }
+                        // Grouping: if GROUP BY present, compute key and skip duplicates
+                        if (group_by_expr_slice) |gbs| {
+                            var pg = Parser.init(gbs);
+                            pg.eval_columns = tbl.columns;
+                            pg.eval_row = row;
+                            pg.eval_table_name = table_name;
+                            const gkey = pg.parseExpression() catch |err| return err;
+                            pg.skipWhitespaceAndComments();
+                            // de-dup by key
+                            var seen = false;
+                            var gi: usize = 0;
+                            while (gi < group_keys.items.len) : (gi += 1) {
+                                if (valueEq(group_keys.items[gi], gkey)) { seen = true; break; }
+                            }
+                            if (seen) continue;
+                            try group_keys.append(gkey);
+                        }
                         // Evaluate projection using select_list_slice
                         var ps = Parser.init(select_list_slice);
                         ps.eval_columns = tbl.columns;
@@ -1779,6 +2065,12 @@ const Parser = struct {
                         ps.eval_table_name = table_name;
                         const items_eval = ps.parseSelectList(arena) catch |err| return err;
                         if (ps.had_division_by_zero) return ParseError.DivisionByZero;
+                        // If grouping, ensure all column references in the evaluated projection
+                        // depend only on the grouping key (i.e., are function of group-by). Our simple
+                        // type system allows this check by verifying that any identifier used is among
+                        // the group-by identifiers. We approximate by re-parsing select_list_slice and
+                        // ensuring any column identifier encountered is in the group-by tokens.
+                        // No evaluation-time group-by validation needed; handled statically above for simple columns
                         var out = std.array_list.Managed(Value).init(arena);
                         errdefer out.deinit();
                         for (items_eval) |it| try out.append(it.expr);
@@ -1845,6 +2137,24 @@ const Parser = struct {
                                             else => return ParseError.ValidationError,
                                         }
                                     }
+                                    // Grouping: if GROUP BY present, compute key and skip duplicates
+                                    if (group_by_expr_slice) |gbs| {
+                                        var pg = Parser.init(gbs);
+                                        var ctxs2g = [_]EvalTableCtx{
+                                            .{ .table_name = table_name, .alias = null, .columns = tbl.columns, .row = lrow },
+                                            .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_right.columns, .row = rrow },
+                                        };
+                                        pg.eval_join_ctx = &ctxs2g;
+                                        const gkey = pg.parseExpression() catch |err| return err;
+                                        pg.skipWhitespaceAndComments();
+                                        var seen = false;
+                                        var gi: usize = 0;
+                                        while (gi < group_keys.items.len) : (gi += 1) {
+                                            if (valueEq(group_keys.items[gi], gkey)) { seen = true; break; }
+                                        }
+                                        if (seen) continue;
+                                        try group_keys.append(gkey);
+                                    }
                                     // Evaluate projection
                                     var ps = Parser.init(select_list_slice);
                                     var ctxs3 = [_]EvalTableCtx{
@@ -1879,6 +2189,24 @@ const Parser = struct {
                                         .null => continue,
                                         else => return ParseError.ValidationError,
                                     }
+                                }
+                                // Grouping: if GROUP BY present, compute key and skip duplicates
+                                if (group_by_expr_slice) |gbs| {
+                                    var pg = Parser.init(gbs);
+                                    var ctxs2g = [_]EvalTableCtx{
+                                        .{ .table_name = table_name, .alias = null, .columns = tbl.columns, .row = lrow },
+                                        .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_right.columns, .row = null_right },
+                                    };
+                                    pg.eval_join_ctx = &ctxs2g;
+                                    const gkey = pg.parseExpression() catch |err| return err;
+                                    pg.skipWhitespaceAndComments();
+                                    var seen = false;
+                                    var gi: usize = 0;
+                                    while (gi < group_keys.items.len) : (gi += 1) {
+                                        if (valueEq(group_keys.items[gi], gkey)) { seen = true; break; }
+                                    }
+                                    if (seen) continue;
+                                    try group_keys.append(gkey);
                                 }
                                 var ps = Parser.init(select_list_slice);
                                 var ctxs3 = [_]EvalTableCtx{
@@ -1918,6 +2246,24 @@ const Parser = struct {
                                         .null => continue,
                                         else => return ParseError.ValidationError,
                                     }
+                                }
+                                // Grouping: if GROUP BY present, compute key and skip duplicates
+                                if (group_by_expr_slice) |gbs| {
+                                    var pg = Parser.init(gbs);
+                                    var ctxs2g = [_]EvalTableCtx{
+                                        .{ .table_name = table_name, .alias = null, .columns = tbl.columns, .row = null_left },
+                                        .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_right.columns, .row = rrow },
+                                    };
+                                    pg.eval_join_ctx = &ctxs2g;
+                                    const gkey = pg.parseExpression() catch |err| return err;
+                                    pg.skipWhitespaceAndComments();
+                                    var seen = false;
+                                    var gi: usize = 0;
+                                    while (gi < group_keys.items.len) : (gi += 1) {
+                                        if (valueEq(group_keys.items[gi], gkey)) { seen = true; break; }
+                                    }
+                                    if (seen) continue;
+                                    try group_keys.append(gkey);
                                 }
                                 var ps = Parser.init(select_list_slice);
                                 var ctxs3 = [_]EvalTableCtx{
@@ -2310,6 +2656,65 @@ const Parser = struct {
         return ParseError.ParsingError;
     }
 };
+
+// Helper: equality check for grouping keys
+fn valueEq(a: Value, b: Value) bool {
+    return switch (a) {
+        .integer => |ai| switch (b) { .integer => |bi| ai == bi, else => false },
+        .boolean => |ab| switch (b) { .boolean => |bb| ab == bb, else => false },
+        .null => switch (b) { .null => true, else => false },
+    };
+}
+
+// Helper: identifier scanning for GROUP BY validation
+fn isIdentChar2(c: u8) bool { return Parser.isIdentChar(c); }
+
+fn nextIdent(slice: []const u8, pos_ptr: *usize) ?[]const u8 {
+    var i: usize = pos_ptr.*;
+    // skip whitespace
+    while (i < slice.len and (slice[i] == ' ' or slice[i] == '\n' or slice[i] == '\r' or slice[i] == '\t')) : (i += 1) {}
+    if (i >= slice.len) return null;
+    if (!Parser.isIdentStart(slice[i])) return null;
+    const start = i;
+    i += 1;
+    while (i < slice.len and isIdentChar2(slice[i])) : (i += 1) {}
+    pos_ptr.* = i;
+    return slice[start..i];
+}
+
+fn identIsColumn(ident: []const u8, cols_l: []const ColumnDef, cols_r: []const ColumnDef) bool {
+    var ci: usize = 0;
+    while (ci < cols_l.len) : (ci += 1) if (std.ascii.eqlIgnoreCase(cols_l[ci].name, ident)) return true;
+    var cj: usize = 0;
+    while (cj < cols_r.len) : (cj += 1) if (std.ascii.eqlIgnoreCase(cols_r[cj].name, ident)) return true;
+    return false;
+}
+
+fn inSet(idents: []const []const u8, ident: []const u8) bool {
+    var k: usize = 0;
+    while (k < idents.len) : (k += 1) if (std.ascii.eqlIgnoreCase(idents[k], ident)) return true;
+    return false;
+}
+
+// Scan forward for a keyword at a word boundary; returns start index or null
+fn scanKeywordForward(input: []const u8, start: usize, kw: []const u8) ?usize {
+    if (kw.len == 0) return null;
+    var i: usize = start;
+    while (i + kw.len <= input.len) : (i += 1) {
+        const c0 = std.ascii.toLower(input[i]);
+        if (c0 == std.ascii.toLower(kw[0])) {
+            var k: usize = 0;
+            while (k < kw.len and std.ascii.toLower(input[i + k]) == std.ascii.toLower(kw[k])) : (k += 1) {}
+            if (k == kw.len) {
+                const after = i + kw.len;
+                const boundary_before = i == 0 or !Parser.isIdentChar(input[i - 1]);
+                const boundary_after = after >= input.len or !Parser.isIdentChar(input[after]);
+                if (boundary_before and boundary_after) return i;
+            }
+        }
+    }
+    return null;
+}
 
 fn jsonWriteStringEscaped(writer: anytype, s: []const u8) !void {
     try writer.writeByte('"');

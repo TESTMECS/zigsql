@@ -215,6 +215,22 @@ const Parser = struct {
     // Declared at top-level below; only referenced here
     eval_join_ctx: ?[]const EvalTableCtx = null,
 
+    // Aggregation evaluation context (single-table grouping for now)
+    agg_single_columns: ?[]const ColumnDef = null,
+    agg_single_rows: ?[][]Value = null,
+    agg_single_table_name: ?[]const u8 = null,
+    agg_group_by_expr_slice: ?[]const u8 = null,
+    agg_current_key: ?Value = null,
+    in_aggregate: bool = false,
+    // Join-aggregate context
+    agg_join_left_columns: ?[]const ColumnDef = null,
+    agg_join_right_columns: ?[]const ColumnDef = null,
+    agg_join_left_rows: ?[][]Value = null,
+    agg_join_right_rows: ?[][]Value = null,
+    agg_join_table_name_left: ?[]const u8 = null,
+    agg_join_table_name_right: ?[]const u8 = null,
+    agg_join_alias_right: ?[]const u8 = null,
+
     fn init(input: []const u8) Parser {
         return .{ .input = input, .pos = 0 };
     }
@@ -398,10 +414,15 @@ const Parser = struct {
                 // parse 0..N args separated by commas, allow whitespace
                 var args = std.array_list.Managed(Value).init(std.heap.page_allocator);
                 defer args.deinit();
+                var arg0_start: usize = 0;
+                var arg0_end: usize = 0;
+                var captured_first = false;
                 self.skipWhitespaceAndComments();
                 if (!self.matchChar(')')) {
                     while (true) {
+                        if (!captured_first) arg0_start = self.pos;
                         const v = try self.parseExpression();
+                        if (!captured_first) { arg0_end = self.pos; captured_first = true; }
                         try args.append(v);
                         self.skipWhitespaceAndComments();
                         if (self.matchChar(',')) {
@@ -438,6 +459,127 @@ const Parser = struct {
                     }
                     const res: i64 = @rem(lhs, rhs);
                     return Value{ .integer = res };
+                } else if (std.ascii.eqlIgnoreCase(fn_name, "count")) {
+                    // COUNT(x): counts rows in current group where x is not NULL
+                    if (args.items.len != 1) return ParseError.ValidationError;
+                    // Disallow aggregate over aggregate by looking into first argument token stream for 'count' or 'sum'
+                    if (self.in_aggregate and captured_first and arg0_end > arg0_start) {
+                        const aslice = self.input[arg0_start..arg0_end];
+                        if (scanKeywordForward(aslice, 0, "count")) |pc| {
+                            var j: usize = pc + 5;
+                            while (j < aslice.len and (aslice[j] == ' ' or aslice[j] == '\n' or aslice[j] == '\r' or aslice[j] == '\t')) : (j += 1) {}
+                            if (j < aslice.len and aslice[j] == '(') return ParseError.ValidationError;
+                        }
+                        if (scanKeywordForward(aslice, 0, "sum")) |ps| {
+                            var j2: usize = ps + 3;
+                            while (j2 < aslice.len and (aslice[j2] == ' ' or aslice[j2] == '\n' or aslice[j2] == '\r' or aslice[j2] == '\t')) : (j2 += 1) {}
+                            if (j2 < aslice.len and aslice[j2] == '(') return ParseError.ValidationError;
+                        }
+                    }
+                    if (!self.in_aggregate) return ParseError.ValidationError;
+                    // Support single-table or join contexts
+                    const rows = if (self.agg_single_rows) |r| r else blk_rows: {
+                        const lj = self.agg_join_left_rows orelse return Value{ .integer = 0 };
+                        break :blk_rows lj; // iterate left rows; we will use join ctx for evaluation
+                    };
+                    const cols = if (self.agg_single_columns) |c| c else (self.agg_join_left_columns orelse return ParseError.ValidationError);
+                    const tname = if (self.agg_single_table_name) |n| n else (self.agg_join_table_name_left orelse return ParseError.ValidationError);
+                    const gb_slice_opt = self.agg_group_by_expr_slice; // null => implicit group over all rows
+                    const current_key = if (gb_slice_opt == null) Value.null else (self.agg_current_key orelse return ParseError.ValidationError);
+                    var cnt: i64 = 0;
+                    var ri: usize = 0;
+                    const arg_slice = if (captured_first and arg0_end > arg0_start) self.input[arg0_start..arg0_end] else self.input[0..0];
+                    while (ri < rows.len) : (ri += 1) {
+                        const row = rows[ri];
+                        // if grouping expression provided, compute and filter; else include all rows
+                        if (gb_slice_opt) |gb_slice| {
+                            var pg = Parser.init(gb_slice);
+                            pg.eval_columns = cols;
+                            pg.eval_row = row;
+                            pg.eval_table_name = tname;
+                            const gk = pg.parseExpression() catch |err| return err;
+                            if (!valueEq(gk, current_key)) continue;
+                        }
+                        // Evaluate the argument expression in the row context; handle join if present
+                        var pa = Parser.init(arg_slice);
+                        if (self.agg_join_right_rows) |_| {
+                            const idxj: usize = ri;
+                            const rrow = (self.agg_join_right_rows.?)[idxj];
+                            var ctxsj = [_]EvalTableCtx{
+                                .{ .table_name = self.agg_join_table_name_left.?, .alias = null, .columns = self.agg_join_left_columns.?, .row = (self.agg_join_left_rows.?)[idxj] },
+                                .{ .table_name = self.agg_join_table_name_right.?, .alias = self.agg_join_alias_right, .columns = self.agg_join_right_columns.?, .row = rrow },
+                            };
+                            pa.eval_join_ctx = &ctxsj;
+                        } else {
+                            pa.eval_columns = cols;
+                            pa.eval_row = row;
+                            pa.eval_table_name = tname;
+                        }
+                        const av = pa.parseExpression() catch |err| return err;
+                        if (av != .null) cnt += 1;
+                    }
+                    return Value{ .integer = cnt };
+                } else if (std.ascii.eqlIgnoreCase(fn_name, "sum")) {
+                    if (args.items.len != 1) return ParseError.ValidationError;
+                    if (self.in_aggregate and captured_first and arg0_end > arg0_start) {
+                        const aslice = self.input[arg0_start..arg0_end];
+                        if (scanKeywordForward(aslice, 0, "count")) |pc2| {
+                            var j: usize = pc2 + 5;
+                            while (j < aslice.len and (aslice[j] == ' ' or aslice[j] == '\n' or aslice[j] == '\r' or aslice[j] == '\t')) : (j += 1) {}
+                            if (j < aslice.len and aslice[j] == '(') return ParseError.ValidationError;
+                        }
+                        if (scanKeywordForward(aslice, 0, "sum")) |ps2| {
+                            var j2: usize = ps2 + 3;
+                            while (j2 < aslice.len and (aslice[j2] == ' ' or aslice[j2] == '\n' or aslice[j2] == '\r' or aslice[j2] == '\t')) : (j2 += 1) {}
+                            if (j2 < aslice.len and aslice[j2] == '(') return ParseError.ValidationError;
+                        }
+                    }
+                    if (!self.in_aggregate) return ParseError.ValidationError;
+                    const rows = if (self.agg_single_rows) |r| r else (self.agg_join_left_rows orelse return Value.null);
+                    const cols = if (self.agg_single_columns) |c| c else (self.agg_join_left_columns orelse return ParseError.ValidationError);
+                    const tname = if (self.agg_single_table_name) |n| n else (self.agg_join_table_name_left orelse return ParseError.ValidationError);
+                    const gb_slice_opt = self.agg_group_by_expr_slice;
+                    const current_key = if (gb_slice_opt == null) Value.null else (self.agg_current_key orelse return ParseError.ValidationError);
+                    var any_non_null = false;
+                    var acc: i64 = 0;
+                    var ri: usize = 0;
+                    const arg_slice = if (captured_first and arg0_end > arg0_start) self.input[arg0_start..arg0_end] else self.input[0..0];
+                    while (ri < rows.len) : (ri += 1) {
+                        const row = rows[ri];
+                        if (gb_slice_opt) |gb_slice| {
+                            var pg = Parser.init(gb_slice);
+                            pg.eval_columns = cols;
+                            pg.eval_row = row;
+                            pg.eval_table_name = tname;
+                            const gk = pg.parseExpression() catch |err| return err;
+                            if (!valueEq(gk, current_key)) continue;
+                        }
+                        // Evaluate the argument: only support constants or single column references
+                        // Evaluate argument per row in context, allowing column references
+                        // We support integer constants, integer column references, and integer expressions
+                        var pe = Parser.init(arg_slice);
+                        if (self.agg_join_right_rows) |_| {
+                            const idxj: usize = ri;
+                            const rrow = (self.agg_join_right_rows.?)[idxj];
+                            var ctxsj = [_]EvalTableCtx{
+                                .{ .table_name = self.agg_join_table_name_left.?, .alias = null, .columns = self.agg_join_left_columns.?, .row = (self.agg_join_left_rows.?)[idxj] },
+                                .{ .table_name = self.agg_join_table_name_right.?, .alias = self.agg_join_alias_right, .columns = self.agg_join_right_columns.?, .row = rrow },
+                            };
+                            pe.eval_join_ctx = &ctxsj;
+                        } else {
+                            pe.eval_columns = cols;
+                            pe.eval_row = row;
+                            pe.eval_table_name = tname;
+                        }
+                        const av = pe.parseExpression() catch |err| return err;
+                        switch (av) {
+                            .null => {},
+                            .integer => |n| { any_non_null = true; acc += n; },
+                            else => return ParseError.ValidationError,
+                        }
+                    }
+                    if (!any_non_null) return Value.null;
+                    return Value{ .integer = acc };
                 } else {
                     // unknown function
                     return ParseError.ValidationError;
@@ -1316,6 +1458,23 @@ const Parser = struct {
                     }
                     break :blk_paren found;
                 };
+                const select_contains_aggregate = blk_agg: {
+                    const pos_cnt = scanKeywordForward(self.input, select_list_start, "count");
+                    const pos_sum = scanKeywordForward(self.input, select_list_start, "sum");
+                    var found = false;
+                    if (pos_cnt) |pc| {
+                        var j: usize = pc + 5; // after 'count'
+                        while (j < from_pos_opt and (self.input[j] == ' ' or self.input[j] == '\n' or self.input[j] == '\r' or self.input[j] == '\t')) : (j += 1) {}
+                        if (j < from_pos_opt and self.input[j] == '(') found = true;
+                    }
+                    if (!found and pos_sum != null) {
+                        const ps = pos_sum.?;
+                        var j2: usize = ps + 3; // after 'sum'
+                        while (j2 < from_pos_opt and (self.input[j2] == ' ' or self.input[j2] == '\n' or self.input[j2] == '\r' or self.input[j2] == '\t')) : (j2 += 1) {}
+                        if (j2 < from_pos_opt and self.input[j2] == '(') found = true;
+                    }
+                    break :blk_agg found;
+                };
 
                 // Parse optional JOIN
                 var join_type: JoinType = .none;
@@ -1583,12 +1742,18 @@ const Parser = struct {
                             const idn = left_names.items[si];
                             // When select_list contains a function call, allow columns not explicitly listed in group-by,
                             // because the expression itself may be function of the group-by (e.g., ABS(a) grouped by ABS(a)).
-                            if (!select_contains_paren and identIsColumn(idn, cols_left, cols_right) and !inSet(gb_idents.items, idn)) return ParseError.ValidationError;
+                            // However, when we have aggregate functions, ungrouped columns are allowed only if they are part of GROUP BY
+                            if (!select_contains_paren and !select_contains_aggregate and identIsColumn(idn, cols_left, cols_right) and !inSet(gb_idents.items, idn)) return ParseError.ValidationError;
+                            // If aggregates present with GROUP BY, bare columns must also be part of GROUP BY
+                            if (select_contains_aggregate and group_by_expr_slice != null and identIsColumn(idn, cols_left, cols_right) and !inSet(gb_idents.items, idn)) return ParseError.ValidationError;
+                            // If aggregates present without GROUP BY (implicit group), any bare column is invalid
+                            if (select_contains_aggregate and group_by_expr_slice == null and identIsColumn(idn, cols_left, cols_right)) return ParseError.ValidationError;
                         }
                     }
 
-                    // When select has expressions, ensure any column references appear only within the group-by expression
-                    if (select_contains_paren) {
+                    // When select has expressions, ensure any column references appear only within the group-by expression.
+                    // Skip this check when aggregate functions are present, since aggregates may reference non-grouped columns.
+                    if (select_contains_paren and !select_contains_aggregate) {
                         // Normalize helper: write lowercased, remove whitespace, drop table qualifier before '.'
                         var sel_norm = std.array_list.Managed(u8).init(arena);
                         errdefer sel_norm.deinit();
@@ -1694,6 +1859,42 @@ const Parser = struct {
                                 continue;
                             }
                             scan += 1;
+                        }
+                    }
+
+                    // If select contains aggregate functions, reject nested aggregates in a single select item
+                    if (select_contains_aggregate) {
+                        // scan for patterns like COUNT( ... COUNT( ... ) ... ) or SUM nested
+                        var depth: usize = 0;
+                        var iagg: usize = select_list_start;
+                        while (iagg + 5 <= from_pos_opt) : (iagg += 1) {
+                            // normalize lowercase
+                            const c0 = std.ascii.toLower(self.input[iagg]);
+                            if (c0 == 'c' or c0 == 's') {
+                                // try match 'count' or 'sum'
+                                var matched_cnt = false;
+                                if (iagg + 5 <= from_pos_opt and std.ascii.eqlIgnoreCase(self.input[iagg .. iagg + 5], "count")) {
+                                    var j = iagg + 5;
+                                    while (j < from_pos_opt and (self.input[j] == ' ' or self.input[j] == '\n' or self.input[j] == '\r' or self.input[j] == '\t')) : (j += 1) {}
+                                    if (j < from_pos_opt and self.input[j] == '(') {
+                                        if (depth > 0) return ParseError.ValidationError;
+                                        depth += 1;
+                                        iagg = j; // will increment by loop
+                                        matched_cnt = true;
+                                    }
+                                }
+                                if (!matched_cnt and iagg + 3 <= from_pos_opt and std.ascii.eqlIgnoreCase(self.input[iagg .. iagg + 3], "sum")) {
+                                    var j2 = iagg + 3;
+                                    while (j2 < from_pos_opt and (self.input[j2] == ' ' or self.input[j2] == '\n' or self.input[j2] == '\r' or self.input[j2] == '\t')) : (j2 += 1) {}
+                                    if (j2 < from_pos_opt and self.input[j2] == '(') {
+                                        if (depth > 0) return ParseError.ValidationError;
+                                        depth += 1;
+                                        iagg = j2;
+                                    }
+                                }
+                            } else if (self.input[iagg] == ')') {
+                                if (depth > 0) depth -= 1;
+                            }
                         }
                     }
                 } else {
@@ -1935,6 +2136,27 @@ const Parser = struct {
                 const t_idx = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
                 const tbl = g_db.tables.items[t_idx];
 
+                // Implicit aggregation validation: if aggregates present without GROUP BY,
+                // bare column references in the select list are invalid.
+                if (join_type == .none and group_by_expr_slice == null) {
+                    const from_has_aggregate = blk_ag2: {
+                        break :blk_ag2 (scanKeywordForward(self.input, select_list_start, "count") != null) or (scanKeywordForward(self.input, select_list_start, "sum") != null);
+                    };
+                    if (from_has_aggregate) {
+                        var idxp: usize = 0;
+                        while (idxp < left_names.items.len) : (idxp += 1) {
+                            if (proj_ops.items[idxp] == 0 and !left_is_lit.items[idxp] and proj_right_names.items[idxp] == null) {
+                                const nm = left_names.items[idxp];
+                                // if nm matches a table column name, it's a bare column => invalid
+                                var ci_chk: usize = 0;
+                                while (ci_chk < tbl.columns.len) : (ci_chk += 1) {
+                                    if (std.ascii.eqlIgnoreCase(tbl.columns[ci_chk].name, nm)) return ParseError.ValidationError;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Resolve and pre-validate only for non-join simple table selects
                 var col_indices = std.array_list.Managed(?usize).init(arena);
                 errdefer col_indices.deinit();
@@ -2020,8 +2242,47 @@ const Parser = struct {
                 // When grouping, track unique keys to emit one row per group
                 var group_keys = std.array_list.Managed(Value).init(arena);
                 errdefer group_keys.deinit();
+                // For aggregates: capture all input rows for single-table grouping
+                var all_rows = std.array_list.Managed([]const Value).init(arena);
+                errdefer all_rows.deinit();
 
                 if (join_type == .none) {
+                    const implicit_agg = (group_by_expr_slice == null) and select_contains_aggregate;
+                    // Handle implicit aggregate on empty table: emit single row now
+                    if (implicit_agg) {
+                        const t_rows_len = tbl.rows.items.len;
+                        if (t_rows_len == 0) {
+                            var ps0 = Parser.init(select_list_slice);
+                            ps0.in_aggregate = true;
+                            ps0.agg_single_columns = tbl.columns;
+                            const empty_rows = try arena.alloc([]Value, 0);
+                            ps0.agg_single_rows = @ptrCast(empty_rows);
+                            ps0.agg_single_table_name = table_name;
+                            ps0.agg_group_by_expr_slice = null;
+                            ps0.agg_current_key = null;
+                            // Provide dummy row/columns so argument identifiers parse
+                            var dummy0 = try arena.alloc(Value, tbl.columns.len);
+                            var di0: usize = 0; while (di0 < tbl.columns.len) : (di0 += 1) {
+                                dummy0[di0] = switch (tbl.columns[di0].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                            }
+                            ps0.eval_columns = tbl.columns;
+                            ps0.eval_row = dummy0;
+                            ps0.eval_table_name = table_name;
+                            const items0 = ps0.parseSelectList(arena) catch |err| return err;
+                            if (ps0.had_division_by_zero) return ParseError.DivisionByZero;
+                            var out0 = std.array_list.Managed(Value).init(arena);
+                            errdefer out0.deinit();
+                            for (items0) |it| try out0.append(it.expr);
+                            try result_rows.append(try out0.toOwnedSlice());
+                            // skip scanning rows
+                            // proceed to ORDER BY / LIMIT processing below
+                            // Jump to after row scan label is not supported here; emulate by skipping row loop
+                            // by setting row_index to end
+                            // (harmless since we break immediately after appending result)
+                            // Note: fallthrough to ORDER BY via normal control flow
+                        }
+                    }
+
                     var row_index: usize = 0;
                     while (row_index < tbl.rows.items.len) : (row_index += 1) {
                         const row = tbl.rows.items[row_index];
@@ -2058,11 +2319,74 @@ const Parser = struct {
                             if (seen) continue;
                             try group_keys.append(gkey);
                         }
+                        // Implicit aggregate: evaluate once over all rows
+                    if (implicit_agg) {
+                        // No rows case: emit single row with aggregate over empty set
+                        if (tbl.rows.items.len == 0) {
+                            var ps0 = Parser.init(select_list_slice);
+                            ps0.in_aggregate = true;
+                            ps0.agg_single_columns = tbl.columns;
+                            // empty rows
+                            const empty_rows = try arena.alloc([]Value, 0);
+                            ps0.agg_single_rows = @ptrCast(empty_rows);
+                            ps0.agg_single_table_name = table_name;
+                            ps0.agg_group_by_expr_slice = null;
+                            ps0.agg_current_key = null;
+                            const items0 = ps0.parseSelectList(arena) catch |err| return err;
+                            if (ps0.had_division_by_zero) return ParseError.DivisionByZero;
+                            var out0 = std.array_list.Managed(Value).init(arena);
+                            errdefer out0.deinit();
+                            for (items0) |it| try out0.append(it.expr);
+                            try result_rows.append(try out0.toOwnedSlice());
+                            break;
+                        }
+                            var ps = Parser.init(select_list_slice);
+                            ps.eval_columns = tbl.columns;
+                            ps.eval_row = row;
+                            ps.eval_table_name = table_name;
+                            // build all_rows
+                            if (all_rows.items.len == 0) {
+                                var ri_build: usize = 0;
+                                while (ri_build < tbl.rows.items.len) : (ri_build += 1) {
+                                    try all_rows.append(tbl.rows.items[ri_build]);
+                                }
+                            }
+                            ps.in_aggregate = true;
+                            ps.agg_single_columns = tbl.columns;
+                            ps.agg_single_rows = @ptrCast(all_rows.items);
+                            ps.agg_single_table_name = table_name;
+                            ps.agg_group_by_expr_slice = null;
+                            ps.agg_current_key = null;
+                            const items_eval = ps.parseSelectList(arena) catch |err| return err;
+                            if (ps.had_division_by_zero) return ParseError.DivisionByZero;
+                            var out = std.array_list.Managed(Value).init(arena);
+                            errdefer out.deinit();
+                            for (items_eval) |it| try out.append(it.expr);
+                            try source_row_indices.append(row_index);
+                            try result_rows.append(try out.toOwnedSlice());
+                            break;
+                        }
                         // Evaluate projection using select_list_slice
                         var ps = Parser.init(select_list_slice);
                         ps.eval_columns = tbl.columns;
                         ps.eval_row = row;
                         ps.eval_table_name = table_name;
+                        if (group_by_expr_slice) |gbs_local| {
+                            // Prepare aggregate context for COUNT/SUM
+                            // Build all rows cache lazily (first group only)
+                            if (all_rows.items.len == 0) {
+                                var ri_build: usize = 0;
+                                while (ri_build < tbl.rows.items.len) : (ri_build += 1) {
+                                    try all_rows.append(tbl.rows.items[ri_build]);
+                                }
+                            }
+                            ps.in_aggregate = true;
+                            ps.agg_single_columns = tbl.columns;
+                            ps.agg_single_rows = @ptrCast(all_rows.items);
+                            ps.agg_single_table_name = table_name;
+                            ps.agg_group_by_expr_slice = gbs_local;
+                            ps.agg_current_key = if (group_by_expr_slice != null) group_keys.items[group_keys.items.len - 1] else null;
+                        }
                         const items_eval = ps.parseSelectList(arena) catch |err| return err;
                         if (ps.had_division_by_zero) return ParseError.DivisionByZero;
                         // If grouping, ensure all column references in the evaluated projection
@@ -2162,6 +2486,57 @@ const Parser = struct {
                                         .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_right.columns, .row = rrow },
                                     };
                                     ps.eval_join_ctx = &ctxs3;
+                                    // Provide aggregate context for join + group by: build all matched pairs for current group key
+                                    if (group_by_expr_slice) |gbsj| {
+                                        // Build rows for current group across all left/right matches
+                                        var left_rows_group = std.array_list.Managed([]Value).init(arena);
+                                        var right_rows_group = std.array_list.Managed([]Value).init(arena);
+                                        var li2: usize = 0;
+                                        const current_key = group_keys.items[group_keys.items.len - 1];
+                                        while (li2 < tbl.rows.items.len) : (li2 += 1) {
+                                            const l2 = tbl.rows.items[li2];
+                                            var rj2: usize = 0;
+                                            while (rj2 < tbl_right.rows.items.len) : (rj2 += 1) {
+                                                const r2 = tbl_right.rows.items[rj2];
+                                                const match2 = try eval_on.check(on_slice.?, l2, r2, &tbl, &tbl_right, table_name, join_table_name, join_table_alias);
+                                                if (!match2) continue;
+                                                // WHERE filter if present for this pair
+                                                if (where_slice) |ws2| {
+                                                    var pw = Parser.init(ws2);
+                                                    var cpair = [_]EvalTableCtx{
+                                                        .{ .table_name = table_name, .alias = null, .columns = tbl.columns, .row = l2 },
+                                                        .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_right.columns, .row = r2 },
+                                                    };
+                                                    pw.eval_join_ctx = &cpair;
+                                                    const condw = pw.parseExpression() catch |err| return err;
+                                                    switch (condw) {
+                                                        .boolean => |bw| if (!bw) { continue; },
+                                                        .null => continue,
+                                                        else => return ParseError.ValidationError,
+                                                    }
+                                                }
+                                                var pg2 = Parser.init(gbsj);
+                                                var ctx2 = [_]EvalTableCtx{
+                                                    .{ .table_name = table_name, .alias = null, .columns = tbl.columns, .row = l2 },
+                                                    .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_right.columns, .row = r2 },
+                                                };
+                                                pg2.eval_join_ctx = &ctx2;
+                                                const gk2 = pg2.parseExpression() catch |err| return err;
+                                                if (!valueEq(gk2, current_key)) continue;
+                                                try left_rows_group.append(l2);
+                                                try right_rows_group.append(r2);
+                                            }
+                                        }
+                                        ps.in_aggregate = true;
+                                        ps.agg_join_left_columns = tbl.columns;
+                                        ps.agg_join_right_columns = tbl_right.columns;
+                                        ps.agg_join_left_rows = @ptrCast(left_rows_group.items);
+                                        ps.agg_join_right_rows = @ptrCast(right_rows_group.items);
+                                        ps.agg_join_table_name_left = table_name;
+                                        ps.agg_join_table_name_right = join_table_name;
+                                        ps.agg_join_alias_right = join_table_alias;
+                                        // Evaluate once for this group and continue to next left row (avoid duplicate appends)
+                                    }
                                     const items_eval = ps.parseSelectList(arena) catch |err| return err;
                                     if (ps.had_division_by_zero) return ParseError.DivisionByZero;
                                     var out = std.array_list.Managed(Value).init(arena);
@@ -2282,6 +2657,7 @@ const Parser = struct {
                     }
                 }
 
+                // ORDER BY
                 // ORDER BY
                 if (order_by_alias != null or order_by_expr_slice != null) {
                     // Build keys for sorting

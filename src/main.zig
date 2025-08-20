@@ -1369,33 +1369,67 @@ const Parser = struct {
                 const after_from_pos = self.pos;
                 if (self.matchKeyword("where")) {
                     const where_start = self.pos;
-                    // For initial parse, allow resolving identifiers as columns using dummy row
-                    // to locate end of expression and catch obvious type errors early.
-                    const t_idx_preview = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
-                    const tbl_preview = g_db.tables.items[t_idx_preview];
-                    var dummy_row = try arena.alloc(Value, tbl_preview.columns.len);
-                    defer arena.free(dummy_row);
-                    var di: usize = 0;
-                    while (di < tbl_preview.columns.len) : (di += 1) {
-                        dummy_row[di] = switch (tbl_preview.columns[di].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                    if (join_type == .none) {
+                        // Single-table WHERE pre-parse with table context
+                        const t_idx_preview = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                        const tbl_preview = g_db.tables.items[t_idx_preview];
+                        var dummy_row = try arena.alloc(Value, tbl_preview.columns.len);
+                        defer arena.free(dummy_row);
+                        var di: usize = 0;
+                        while (di < tbl_preview.columns.len) : (di += 1) {
+                            dummy_row[di] = switch (tbl_preview.columns[di].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                        }
+                        var sub = Parser.init(self.input[where_start..]);
+                        sub.eval_columns = tbl_preview.columns;
+                        sub.eval_row = dummy_row;
+                        sub.eval_table_name = table_name;
+                        const where_preview_val = sub.parseExpression() catch |err| return err;
+                        sub.skipWhitespaceAndComments();
+                        // Type check WHERE: must evaluate to boolean or null
+                        switch (where_preview_val) {
+                            .boolean => {},
+                            .null => {},
+                            else => return ParseError.ValidationError,
+                        }
+                        const where_len = sub.pos;
+                        where_slice = self.input[where_start .. where_start + where_len];
+                        self.pos = where_start + where_len;
+                        self.skipWhitespaceAndComments();
+                    } else {
+                        // Join WHERE pre-parse with dual-table context
+                        const t_idx_left = dbFindTableIndex(table_name) orelse return ParseError.ValidationError;
+                        const t_idx_right = dbFindTableIndex(join_table_name) orelse return ParseError.ValidationError;
+                        const tbl_left = g_db.tables.items[t_idx_left];
+                        const tbl_right = g_db.tables.items[t_idx_right];
+                        var dummy_left = try arena.alloc(Value, tbl_left.columns.len);
+                        defer arena.free(dummy_left);
+                        var dummy_right = try arena.alloc(Value, tbl_right.columns.len);
+                        defer arena.free(dummy_right);
+                        var il: usize = 0; while (il < dummy_left.len) : (il += 1) {
+                            dummy_left[il] = switch (tbl_left.columns[il].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                        }
+                        var ir: usize = 0; while (ir < dummy_right.len) : (ir += 1) {
+                            dummy_right[ir] = switch (tbl_right.columns[ir].typ) { .integer => Value{ .integer = 1 }, .boolean => Value{ .boolean = true } };
+                        }
+                        var sub = Parser.init(self.input[where_start..]);
+                        var ctxs_where = [_]EvalTableCtx{
+                            .{ .table_name = table_name, .alias = null, .columns = tbl_left.columns, .row = dummy_left },
+                            .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_right.columns, .row = dummy_right },
+                        };
+                        sub.eval_join_ctx = &ctxs_where;
+                        const where_preview_val = sub.parseExpression() catch |err| return err;
+                        sub.skipWhitespaceAndComments();
+                        // Type check WHERE: must evaluate to boolean or null
+                        switch (where_preview_val) {
+                            .boolean => {},
+                            .null => {},
+                            else => return ParseError.ValidationError,
+                        }
+                        const where_len = sub.pos;
+                        where_slice = self.input[where_start .. where_start + where_len];
+                        self.pos = where_start + where_len;
+                        self.skipWhitespaceAndComments();
                     }
-                    var sub = Parser.init(self.input[where_start..]);
-                    sub.eval_columns = tbl_preview.columns;
-                    sub.eval_row = dummy_row;
-                    sub.eval_table_name = table_name;
-                    const where_preview_val = sub.parseExpression() catch |err| return err;
-                    sub.skipWhitespaceAndComments();
-                    // Type check WHERE: must evaluate to boolean or null
-                    switch (where_preview_val) {
-                        .boolean => {},
-                        .null => {},
-                        else => return ParseError.ValidationError,
-                    }
-                    // capture slice consumed by sub
-                    const where_len = sub.pos;
-                    where_slice = self.input[where_start .. where_start + where_len];
-                    self.pos = where_start + where_len;
-                    self.skipWhitespaceAndComments();
                 } else {
                     self.pos = after_from_pos;
                 }

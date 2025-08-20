@@ -1305,6 +1305,10 @@ const Parser = struct {
                         self.pos = save_alias;
                     }
                     if (!self.matchKeyword("on")) return ParseError.ParsingError;
+                    // Disallow joining the same table name without an alias
+                    if (join_table_alias == null and std.ascii.eqlIgnoreCase(join_table_name, table_name)) {
+                        return ParseError.ValidationError;
+                    }
                     // Validate existence only after we have seen the ON, so
                     // a missing ON is always classified as a parsing error.
                     const t_idx_preview_left = t_idx_preview_left_opt orelse return ParseError.ValidationError;

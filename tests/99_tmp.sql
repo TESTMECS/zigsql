@@ -1,0 +1,9 @@
+--- can use a . to qualify column references with a table
+CREATE TABLE t1(a INTEGER, b BOOLEAN);
+CREATE TABLE t2(a INTEGER, b INTEGER);
+INSERT INTO t1 VALUES (1, TRUE), (2, FALSE);
+INSERT INTO t2 VALUES (1, 10), (2, 20);
+SELECT t1.a, t2.a, t1.b, t2.b FROM t1 INNER JOIN t2 ON t1.a = t2.a;
+--- returns:
+1, 1, TRUE, 10
+2, 2, FALSE, 20

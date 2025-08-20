@@ -79,6 +79,9 @@ const QueryResult = struct {
 /// Supported column types for the in-memory catalog.
 const ColumnType = enum { integer, boolean };
 
+/// Normalized join type for SELECT ... JOIN parsing/evaluation.
+const JoinType = enum { none, inner, left, right, full };
+
 /// Column definition used when creating tables and for type checking.
 const ColumnDef = struct {
     name: []const u8,
@@ -1205,7 +1208,7 @@ const Parser = struct {
                 const select_list_slice: []const u8 = self.input[select_list_start..select_list_end_pos];
 
                 // Parse optional JOIN
-                var join_type: enum { none, inner, left, right, full } = .none;
+                var join_type: JoinType = .none;
                 var join_table_name: []const u8 = undefined;
                 var join_table_alias: ?[]const u8 = null;
                 var on_slice: ?[]const u8 = null;
@@ -1213,9 +1216,7 @@ const Parser = struct {
                 const try_join_pos = self.pos;
                 const t_idx_preview_left_opt = dbFindTableIndex(table_name);
                 if (self.matchKeyword("inner") or self.matchKeyword("left") or self.matchKeyword("right") or self.matchKeyword("full")) {
-                    // If a JOIN is specified but the left table does not exist, surface validation error
-                    const t_idx_preview_left = t_idx_preview_left_opt orelse return ParseError.ValidationError;
-                    const tbl_preview_left = g_db.tables.items[t_idx_preview_left];
+                    // Determine join_type from last matched keyword
                     // Determine join_type from last matched keyword
                     const matched = self.input[try_join_pos..self.pos];
                     if (std.ascii.eqlIgnoreCase(matched, "inner")) join_type = .inner;
@@ -1239,8 +1240,12 @@ const Parser = struct {
                         self.pos = save_alias;
                     }
                     if (!self.matchKeyword("on")) return ParseError.ParsingError;
+                    // Validate existence only after we have seen the ON, so
+                    // a missing ON is always classified as a parsing error.
+                    const t_idx_preview_left = t_idx_preview_left_opt orelse return ParseError.ValidationError;
+                    const tbl_preview_left = g_db.tables.items[t_idx_preview_left];
                     // Build eval ctx to parse ON expression without validation errors
-                    const t_idx_preview_right = dbFindTableIndex(join_table_name) orelse return ParseError.ParsingError;
+                    const t_idx_preview_right = dbFindTableIndex(join_table_name) orelse return ParseError.ValidationError;
                     const tbl_preview_right = g_db.tables.items[t_idx_preview_right];
                     var dummy_left = try arena.alloc(Value, tbl_preview_left.columns.len);
                     defer arena.free(dummy_left);
@@ -1606,11 +1611,15 @@ const Parser = struct {
                             // no right operand present
                             break :blk2 ColumnType.integer; // dummy
                         };
-                        if (opk == '+' or opk == '-' or opk == '*' or opk == '/') {
-                            // Allow NULL literals, which will propagate at row-eval time
-                            if (!(l_type == .integer and r_type == .integer)) return ParseError.ValidationError;
-                        } else if (opk == '&' or opk == '|') {
-                            if (!(l_type == .boolean and r_type == .boolean)) return ParseError.ValidationError;
+                        switch (opk) {
+                            '+', '-', '*', '/' => {
+                                // Allow NULL literals, which will propagate at row-eval time
+                                if (!(l_type == .integer and r_type == .integer)) return ParseError.ValidationError;
+                            },
+                            '&', '|' => {
+                                if (!(l_type == .boolean and r_type == .boolean)) return ParseError.ValidationError;
+                            },
+                            else => {},
                         }
                     }
                 }
@@ -1845,10 +1854,11 @@ const Parser = struct {
                                 };
                                 p3.eval_join_ctx = &ctxs4;
                             }
-                            const kv = p3.parseExpression() catch |err| return err;
+                    const kv = p3.parseExpression() catch |err| return err;
                             p3.skipWhitespaceAndComments();
                             if (!p3.eof()) return ParseError.ParsingError;
-                            if (kv != .integer and kv != .boolean and kv != .null) return ParseError.ValidationError;
+                    // Accept integer/boolean/null order keys only; others are invalid
+                    if (kv != .integer and kv != .boolean and kv != .null) return ParseError.ValidationError;
                             key = kv;
                         } else {
                             // No expression slice and no resolvable alias: treat as missing ORDER BY expression

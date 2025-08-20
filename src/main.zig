@@ -24,6 +24,7 @@
 //!   returns `parsing_error`.
 //!
 const std = @import("std");
+const dbg = @import("std").debug;
 
 // ---------------------------
 // Networking & Server Config
@@ -161,8 +162,9 @@ fn dbCreateTable(name: []const u8, cols: []const ColumnDef) ParseError!void {
     // This is our guard. We promise the compiler no errors can happen after this point. 
     errdefer comptime unreachable;
     // Now the Mutation Path is error Free :)
-
+    // `https://matklad.github.io/2025/08/16/reserve-first.html`
     // Commit the database table state!
+    // We can mutate freely without worrying about errors!
     g_db.tables.appendAssumeCapacity(.{ .name = name_copy, .columns = cols_copy, .rows = std.array_list.Managed([]Value).init(g_db_allocator) });
 }
 
@@ -935,11 +937,6 @@ const Parser = struct {
 
         var table_select = false;
         self.skipWhitespaceAndComments();
-        // Allow table projection to start with an identifier or a literal
-        // (e.g., SELECT 10 / a FROM t). Previously we only proceeded when the
-        // first token looked like an identifier which rejected literal-led
-        // projections and caused a fallback to expression SELECT, producing a
-        // parsing_error. Accept digits and unary minus as starters here.
         if (isIdentStart(self.peek()) or isDigit(self.peek()) or self.peek() == '-') {
             // parse first projection's left operand: identifier or literal
             var first_is_lit = false;
@@ -972,6 +969,7 @@ const Parser = struct {
                 try left_qualifiers.append(null);
                 forced_op_char = '-';
                 forced_right_nm = use_id;
+            // 
             } else if (self.parseIdentifier()) |nm| {
                 var use_nm = nm;
                 var qual_tbl: ?[]const u8 = null;
@@ -1233,7 +1231,6 @@ const Parser = struct {
                 const t_idx_preview_left_opt = dbFindTableIndex(table_name);
                 if (self.matchKeyword("inner") or self.matchKeyword("left") or self.matchKeyword("right") or self.matchKeyword("full")) {
                     // Determine join_type from last matched keyword
-                    // Determine join_type from last matched keyword
                     const matched = self.input[try_join_pos..self.pos];
                     if (std.ascii.eqlIgnoreCase(matched, "inner")) join_type = .inner;
                     if (std.ascii.eqlIgnoreCase(matched, "left")) join_type = .left;
@@ -1260,6 +1257,7 @@ const Parser = struct {
                     // a missing ON is always classified as a parsing error.
                     const t_idx_preview_left = t_idx_preview_left_opt orelse return ParseError.ValidationError;
                     const tbl_preview_left = g_db.tables.items[t_idx_preview_left];
+                    // Ensure ON expression is a valid boolean (or NULL) expression
                     // Build eval ctx to parse ON expression without validation errors
                     const t_idx_preview_right = dbFindTableIndex(join_table_name) orelse return ParseError.ValidationError;
                     const tbl_preview_right = g_db.tables.items[t_idx_preview_right];
@@ -1267,16 +1265,34 @@ const Parser = struct {
                     defer arena.free(dummy_left);
                     var dummy_right = try arena.alloc(Value, tbl_preview_right.columns.len);
                     defer arena.free(dummy_right);
-                    var idx_l: usize = 0; while (idx_l < dummy_left.len) : (idx_l += 1) dummy_left[idx_l] = Value{ .integer = 1 };
-                    var idx_r: usize = 0; while (idx_r < dummy_right.len) : (idx_r += 1) dummy_right[idx_r] = Value{ .integer = 1 };
+                    var idx_l: usize = 0;
+                    while (idx_l < dummy_left.len) : (idx_l += 1) {
+                        dummy_left[idx_l] = switch (tbl_preview_left.columns[idx_l].typ) {
+                            .integer => Value{ .integer = 1 },
+                            .boolean => Value{ .boolean = true },
+                        };
+                    }
+                    var idx_r: usize = 0;
+                    while (idx_r < dummy_right.len) : (idx_r += 1) {
+                        dummy_right[idx_r] = switch (tbl_preview_right.columns[idx_r].typ) {
+                            .integer => Value{ .integer = 1 },
+                            .boolean => Value{ .boolean = true },
+                        };
+                    }
                     var sub_on = Parser.init(self.input[self.pos..]);
                     var ctxs = [_]EvalTableCtx{
                         .{ .table_name = table_name, .alias = null, .columns = tbl_preview_left.columns, .row = dummy_left },
                         .{ .table_name = join_table_name, .alias = join_table_alias, .columns = tbl_preview_right.columns, .row = dummy_right },
                     };
                     sub_on.eval_join_ctx = &ctxs;
-                    _ = sub_on.parseExpression() catch |err| return err;
+                    const on_preview_val = sub_on.parseExpression() catch |err| return err;
                     sub_on.skipWhitespaceAndComments();
+                    // Type check ON: must evaluate to boolean or NULL
+                    switch (on_preview_val) {
+                        .boolean => {},
+                        .null => {},
+                        else => return ParseError.ValidationError,
+                    }
                     const on_len = sub_on.pos;
                     on_slice = self.input[self.pos .. self.pos + on_len];
                     self.pos += on_len;

@@ -10,7 +10,16 @@ passed_test_path = os.path.join(root, '.passed_tests')
 
 
 def format_details(details):
-    return '~'.join(details)
+    # Ensure all parts are strings; convert None to empty string
+    safe_parts = []
+    for d in details:
+        if isinstance(d, str):
+            safe_parts.append(d)
+        elif d is None:
+            safe_parts.append('')
+        else:
+            safe_parts.append(str(d))
+    return '~'.join(safe_parts)
 
 
 def build(using_postgres):

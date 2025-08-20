@@ -1126,10 +1126,23 @@ const Parser = struct {
                 if (!self.matchChar(',')) break;
                 // parse left operand for subsequent projection
                 var nm: []const u8 = undefined;
+                var nm_qual: ?[]const u8 = null;
                 var is_lit: bool = false;
                 var lit_val: Value = undefined;
                 if (self.parseIdentifier()) |t_nm| {
-                    nm = t_nm;
+                    var use_nm2 = t_nm;
+                    const save_after_id2 = self.pos;
+                    self.skipWhitespaceAndComments();
+                    if (self.matchChar('.')) {
+                        nm_qual = t_nm;
+                        const colid2 = self.parseIdentifier() orelse return ParseError.ValidationError;
+                        self.skipWhitespaceAndComments();
+                        if (self.matchChar('.')) return ParseError.ValidationError;
+                        use_nm2 = colid2;
+                    } else {
+                        self.pos = save_after_id2;
+                    }
+                    nm = use_nm2;
                 } else if (self.parseBoolean()) |b| {
                     is_lit = true;
                     lit_val = Value{ .boolean = b };
@@ -1146,9 +1159,11 @@ const Parser = struct {
                 try left_names.append(nm);
                 try left_is_lit.append(is_lit);
                 try left_lits.append(if (is_lit) lit_val else Value.null);
+                try left_qualifiers.append(nm_qual);
                 self.skipWhitespaceAndComments();
                 var op2: u8 = 0;
                 var right2: ?[]const u8 = null;
+                var right2_qual: ?[]const u8 = null;
                 var right2_is_lit = false;
                 var right2_lit: Value = undefined;
                 const c2 = self.peek();
@@ -1156,7 +1171,19 @@ const Parser = struct {
                     op2 = c2;
                     self.advance();
                     if (self.parseIdentifier()) |nm_b| {
-                        right2 = nm_b;
+                        var use_rn = nm_b;
+                        const save_after_rn = self.pos;
+                        self.skipWhitespaceAndComments();
+                        if (self.matchChar('.')) {
+                            right2_qual = nm_b;
+                            const colr2 = self.parseIdentifier() orelse return ParseError.ValidationError;
+                            self.skipWhitespaceAndComments();
+                            if (self.matchChar('.')) return ParseError.ValidationError;
+                            use_rn = colr2;
+                        } else {
+                            self.pos = save_after_rn;
+                        }
+                        right2 = use_rn;
                     } else if (self.parseBoolean()) |bb| {
                         right2_is_lit = true;
                         right2_lit = Value{ .boolean = bb };
@@ -1170,7 +1197,19 @@ const Parser = struct {
                 } else if (self.matchKeyword("and")) {
                     op2 = '&';
                     if (self.parseIdentifier()) |nm_b2| {
-                        right2 = nm_b2;
+                        var use_rn2 = nm_b2;
+                        const save_after_rn2 = self.pos;
+                        self.skipWhitespaceAndComments();
+                        if (self.matchChar('.')) {
+                            right2_qual = nm_b2;
+                            const colr22 = self.parseIdentifier() orelse return ParseError.ValidationError;
+                            self.skipWhitespaceAndComments();
+                            if (self.matchChar('.')) return ParseError.ValidationError;
+                            use_rn2 = colr22;
+                        } else {
+                            self.pos = save_after_rn2;
+                        }
+                        right2 = use_rn2;
                     } else if (self.parseBoolean()) |bb2| {
                         right2_is_lit = true;
                         right2_lit = Value{ .boolean = bb2 };
@@ -1184,7 +1223,19 @@ const Parser = struct {
                 } else if (self.matchKeyword("or")) {
                     op2 = '|';
                     if (self.parseIdentifier()) |nm_b3| {
-                        right2 = nm_b3;
+                        var use_rn3 = nm_b3;
+                        const save_after_rn3 = self.pos;
+                        self.skipWhitespaceAndComments();
+                        if (self.matchChar('.')) {
+                            right2_qual = nm_b3;
+                            const colr3 = self.parseIdentifier() orelse return ParseError.ValidationError;
+                            self.skipWhitespaceAndComments();
+                            if (self.matchChar('.')) return ParseError.ValidationError;
+                            use_rn3 = colr3;
+                        } else {
+                            self.pos = save_after_rn3;
+                        }
+                        right2 = use_rn3;
                     } else if (self.parseBoolean()) |bb3| {
                         right2_is_lit = true;
                         right2_lit = Value{ .boolean = bb3 };
@@ -1209,6 +1260,7 @@ const Parser = struct {
                 try proj_right_names.append(right2);
                 try right_is_lit.append(right2_is_lit);
                 try right_lits.append(if (right2_is_lit) right2_lit else Value.null);
+                try right_qualifiers.append(right2_qual);
             }
             self.skipWhitespaceAndComments();
             const select_list_end_pos = self.pos;

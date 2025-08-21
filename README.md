@@ -14,6 +14,7 @@ The test suite starts with simpler statements such as `SELECT 1;` and builds up 
 
 ### Using
 ### Zig version - v0.15.0-dev.1593+399bace2f
+- Testing new Release 0.15.1 as of 8/21/2025
 
 To start, fork this repository. Then clone it and run:
 ```bash

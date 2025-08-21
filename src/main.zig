@@ -1,5 +1,5 @@
 //! rgsql: a tiny SQL-ish server implemented in Zig
-//!
+//! Kinda hard to get CLEANER CODE THAN 3K LINES but working on it.
 //! Summary
 //! - TCP server speaking a very small protocol: client sends a UTF-8 SQL string
 //!   terminated by a single `\0`; the server responds with a single JSON object

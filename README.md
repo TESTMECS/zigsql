@@ -13,21 +13,16 @@ The test suite starts with simpler statements such as `SELECT 1;` and builds up 
 
 
 ### Using
+### Zig version - v0.15.0-dev.1593+399bace2f
 
 To start, fork this repository. Then clone it and run:
-
 ```bash
 ./run-tests
 ```
-
-Next, follow the instructions of the test runner. You can choose what programming language you want to build your implementation in.
-
 If you want more guidance and suggestions for building your implementation, see the **[Build a Database Server](https://technicaldeft.com/build-a-database-server)** book.
 
 ### Tests cases
-
 The `tests/` directory contains 13 files that check different parts of your implementation. Here's an example test that checks that you can insert multiple rows at once: 
-
 ```sql
 --- can insert multiple rows
 CREATE TABLE t1(a INTEGER, b INTEGER);
@@ -37,7 +32,6 @@ SELECT a, b FROM t1;
 1, 2
 3, 4
 ```
-
 ### Companion book
 
 <a href="https://technicaldeft.com/build-a-database-server"><img alt="Cover of the Build a Database Server book" align=right width=232 height=306 src="https://technicaldeft.com/build_a_database_server_cover.png"/></a>
